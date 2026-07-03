@@ -4,16 +4,34 @@ Registers this daemon as `<device_id>._crosscopy._tcp.local.` via zeroconf and
 browses for other instances. The peer registry is keyed by device id and
 merges mDNS, manual (config.json) and reciprocal-"hello" sightings: the
 freshest sighting wins and its "source" is the one shown. Manual peers never
-expire; hello peers expire after 10 minutes without contact. A "peers" event
-is published on add / update-that-changes-something / expiry — not on every
-refresh.
+expire.
+
+Verify-before-drop (v0.4.2): mDNS removal events and hello-TTL staleness are
+treated as *hearsay*, never as proof of death — macs in wifi power-save churn
+their mDNS announcements every few seconds while staying perfectly reachable.
+A registry record therefore moves through a small state machine:
+
+    ACTIVE --(mDNS remove | last_seen older than HELLO_EXPIRY)--> SUSPECT
+    SUSPECT --(any answered contact: probe, hello either way,
+               confirm_contact, or a fresh mDNS/manual sighting)--> ACTIVE
+    SUSPECT --(verification probe failed AND SUSPECT_GRACE elapsed AND no
+               answered contact within CONTACT_FRESH)--> removed
+
+Suspects are probed in the background (GET /api/ping on every known address,
+short timeout) by a small capped pool, with a per-peer cooldown so a flapping
+LAN never causes thundering probes. Entering/leaving SUSPECT is invisible to
+clients: a "peers" event fires only on real membership or host/name/port
+changes (suppressed transitions are logged at debug).
 
 Reciprocal discovery (v0.3): a hello sender loop POSTs /api/hello (our device
 info) to every known peer on daemon start, every 60 s, when a new mDNS peer
 appears, and whenever hello_now() is called (the server calls it on local
 clipboard changes so remote UIs react instantly). This fixes one-way mDNS
 visibility: if either side can reach the other, both end up knowing each
-other.
+other. A successful outbound hello counts as answered contact, so a reachable
+peer stays fresh even if its own hellos never arrive here. Hello payloads and
+responses carry "clip" (the current clipboard_id) so receivers can publish a
+"peers" event only when the sender's clipboard actually changed.
 
 CROSSCOPY_NO_MDNS=1 disables zeroconf entirely; zeroconf import or
 registration failures are logged and swallowed so the daemon still runs with
@@ -36,10 +54,16 @@ log = logging.getLogger("crosscopy.discovery")
 
 SERVICE_TYPE = "_crosscopy._tcp.local."
 PING_TIMEOUT = 2.0
-PROBE_TIMEOUT = 1.5        # per-candidate reachability probe (host selection)
+PROBE_TIMEOUT = 1.5        # per-candidate reachability probe
 HELLO_TIMEOUT = 2.0
 HELLO_INTERVAL = 60.0      # periodic hello round
-HELLO_EXPIRY = 10 * 60.0   # hello-sourced peers expire after 10 min
+HELLO_EXPIRY = 10 * 60.0   # peers turn suspect after this long without a sighting
+
+# Verify-before-drop state machine (see module docstring):
+CONTACT_FRESH = 90.0       # answered contact this recent => never removed
+SUSPECT_GRACE = 75.0       # minimum time in SUSPECT before removal is allowed
+PROBE_COOLDOWN = 30.0      # per-peer minimum interval between verification probes
+VERIFY_WORKERS = 3         # cap on concurrent verification probes
 
 try:
     from zeroconf import InterfaceChoice, ServiceBrowser, ServiceInfo, Zeroconf
@@ -90,6 +114,17 @@ def get_local_ips() -> list:
     except Exception:
         pass
     return sorted(ips) or [primary]
+
+
+def _current_clip_id() -> str:
+    """The local clipboard_id ("" when empty) — sent in hello payloads and
+    responses so peers can tell whether our clipboard actually changed."""
+    try:
+        from . import clipboard
+        manifest = clipboard.load_clipboard()
+        return str((manifest or {}).get("clipboard_id") or "")
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +189,16 @@ def select_host(addresses: list, port: int, prober=None) -> str:
 
 class Discovery:
     """Zeroconf registration/browsing, hello sender loop, and the unified
-    id-keyed peer registry.
+    id-keyed peer registry with verify-before-drop (see module docstring).
+
+    Registry records carry underscore-prefixed bookkeeping fields that are
+    stripped from get_peers() output:
+      _last_contact   epoch of the last *answered* contact (hello either
+                      direction, confirm_contact, successful probe)
+      _suspect_since  epoch the record entered SUSPECT, or None (ACTIVE)
+      _last_probe     epoch of the last completed verification probe
+      _probe_ok       result of that probe (None until first probe)
+      _clip           the peer's last reported clipboard_id (hello "clip")
 
     Safe to use even when mDNS is disabled or zeroconf is broken: manual and
     hello peers still work.
@@ -172,6 +216,9 @@ class Discovery:
         self._hello_wake = threading.Event()
         self._hello_thread = None
         self._prober = None        # test hook: prober(addr, port) -> bool
+        self._probing = set()      # peer ids with an in-flight verify probe
+        self._verify_pool = ThreadPoolExecutor(
+            max_workers=VERIFY_WORKERS, thread_name_prefix="crosscopy-verify")
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -227,6 +274,7 @@ class Discovery:
     def stop(self) -> None:
         self._stop.set()
         self._hello_wake.set()
+        self._verify_pool.shutdown(wait=False)
         self._shutdown_zeroconf()
 
     def _shutdown_zeroconf(self) -> None:
@@ -255,18 +303,20 @@ class Discovery:
         self._refresh_service(zc, type_, name)
 
     def remove_service(self, zc, type_, name):
+        """An mDNS goodbye/TTL expiry is hearsay, not proof of death: macs in
+        wifi power-save churn announcements every few seconds while staying
+        reachable. Never drop the record here — mark it SUSPECT and verify by
+        probing; _reap_peers() removes it only if the probe fails AND the
+        grace period elapses AND it hasn't answered anything recently."""
         with self._lock:
             peer_id = self._mdns_names.pop(name, None)
-            removed = None
-            if peer_id is not None:
-                record = self._peers.get(peer_id)
-                # Only drop the record if mDNS was its latest sighting;
-                # manual/hello records outlive the mDNS announcement.
-                if record is not None and record.get("source") == "mdns":
-                    removed = self._peers.pop(peer_id, None)
-        log.info("mDNS: peer left: %s", name)
-        if removed is not None:
-            bus.publish("peers")
+            record = self._peers.get(peer_id) if peer_id else None
+        if record is None:
+            log.debug("mDNS: announcement gone for unknown service %s", name)
+            return
+        log.info("mDNS: announcement gone: %s (%s) — verifying before drop",
+                 record.get("name"), name.split(".", 1)[0])
+        self._mark_suspect(peer_id, "mdns announcement removed")
 
     def _refresh_service(self, zc, type_, name):
         try:
@@ -317,16 +367,25 @@ class Discovery:
     # -- unified registry ----------------------------------------------------
 
     def record_peer(self, peer_id, name, host, port, platform, version,
-                    source, addresses=None) -> bool:
+                    source, addresses=None, clip=None) -> bool:
         """Merge a sighting into the id-keyed registry (freshest wins; the
         "source" shown is the most recent sighting's). All candidate
         addresses ever seen for the peer are kept on the record
         ("addresses"); "host" is the selected one (see select_host above).
         A hello/manual sighting's host is contact-confirmed ground truth; an
         mDNS refresh never overwrites a confirmed host, and an already-cached
-        unconfirmed choice is kept rather than re-probed. Publishes a "peers"
-        event when the sighting adds a peer or changes something meaningful —
-        not on plain last_seen refreshes. Returns True if the peer was new."""
+        unconfirmed choice is kept rather than re-probed. Any sighting clears
+        a SUSPECT flag (the peer is evidently around); hello/manual sightings
+        additionally refresh _last_contact (they answered / spoke to us).
+
+        `clip` is the peer's clipboard_id from a hello exchange (None =
+        unknown/not carried; "" = empty clipboard).
+
+        Publishes a "peers" event only on real membership or
+        name/host/port/platform/version/clip changes — plain last_seen
+        refreshes, address-set-only changes, source flips and host_confirmed
+        flips are suppressed (logged at debug). Returns True if the peer was
+        new."""
         if not peer_id or peer_id == config.get_device_id():
             return False
         port = int(port)
@@ -355,6 +414,7 @@ class Discovery:
         else:
             chosen = cand[0] if cand else host
 
+        now = time.time()
         record = {
             "id": peer_id,
             "name": name or peer_id,
@@ -362,11 +422,12 @@ class Discovery:
             "port": port,
             "platform": platform or "unknown",
             "version": version or "unknown",
-            "last_seen": time.time(),
+            "last_seen": now,
             "source": source,
             "addresses": cand,
             "host_confirmed": confirmed,
         }
+        answered = source in ("hello", "manual")
         with self._lock:
             # select_host may have probed for a while; if a confirmed
             # sighting (hello) landed meanwhile, keep its host.
@@ -378,30 +439,50 @@ class Discovery:
                 for addr in current.get("addresses") or []:
                     if addr not in record["addresses"]:
                         record["addresses"].append(addr)
+            # Carry over verification bookkeeping from the live record.
+            live = current if current is not None else (old or {})
+            record["_last_probe"] = live.get("_last_probe", 0)
+            record["_probe_ok"] = live.get("_probe_ok")
+            record["_clip"] = live.get("_clip") if clip is None else clip
+            record["_last_contact"] = now if answered \
+                else live.get("_last_contact", 0)
+            if live.get("_suspect_since") is not None:
+                log.debug("peer %s recovered from suspect (fresh %s sighting)",
+                          record["name"], source)
+            record["_suspect_since"] = None
             self._peers[peer_id] = record
         is_new = old is None
-        # "source" flips (mdns <-> hello sightings alternate) are not
-        # meaningful changes; everything else is.
+        # Membership and what clients display (name/host/port/...) are
+        # meaningful; a "clip" change means the peer's clipboard changed and
+        # clients must refetch. Source flips (mdns <-> hello sightings
+        # alternate), address-set changes and host_confirmed flips are not.
         changed = is_new or any(
             old.get(key) != record[key]
             for key in ("name", "host", "port", "platform", "version")
-        ) or set(old.get("addresses") or []) != set(record["addresses"])
+        ) or (clip is not None and old.get("_clip") != clip)
         if changed:
             if is_new:
                 log.info("peer added: %s (%s:%s) via %s [candidates: %s]",
                          record["name"], record["host"], port, source,
                          ", ".join(cand))
             bus.publish("peers")
+        elif (set(old.get("addresses") or []) != set(record["addresses"])
+                or old.get("source") != source
+                or old.get("host_confirmed") != record["host_confirmed"]):
+            log.debug("peers event suppressed for %s (%s sighting; no "
+                      "membership/host change)", record["name"], source)
         return is_new
 
     def confirm_contact(self, peer_id, host) -> None:
         """A real request exchange with `host` just succeeded: make it the
-        peer's selected host and mark it contact-confirmed so mDNS refreshes
-        won't clobber it. Called by the server after any successful outbound
-        peer request (including the retry path that found a working
-        alternate address)."""
+        peer's selected host, mark it contact-confirmed so mDNS refreshes
+        won't clobber it, refresh _last_contact and clear any SUSPECT flag.
+        Called by the server after any successful outbound peer request
+        (including the retry path that found a working alternate address).
+        Publishes a "peers" event only when the host actually changed."""
         if not peer_id or not host:
             return
+        now = time.time()
         with self._lock:
             record = self._peers.get(peer_id)
             if record is None:
@@ -409,14 +490,22 @@ class Discovery:
             addrs = record.setdefault("addresses", [])
             if host not in addrs:
                 addrs.insert(0, host)
-            changed = (record.get("host") != host
-                       or not record.get("host_confirmed"))
+            host_changed = record.get("host") != host
+            flag_changed = not record.get("host_confirmed")
             record["host"] = host
             record["host_confirmed"] = True
-            record["last_seen"] = time.time()
-        if changed:
+            record["last_seen"] = now
+            record["_last_contact"] = now
+            if record.get("_suspect_since") is not None:
+                log.debug("peer %s recovered from suspect (answered contact)",
+                          record.get("name"))
+            record["_suspect_since"] = None
+        if host_changed:
             log.info("peer %s host confirmed by contact: %s", peer_id, host)
             bus.publish("peers")
+        elif flag_changed:
+            log.debug("peers event suppressed for %s (host_confirmed flip "
+                      "only)", peer_id)
 
     def inject_record_for_tests(self, record: dict) -> None:
         """TEST ONLY: overwrite a raw registry record, bypassing selection
@@ -429,47 +518,150 @@ class Discovery:
     def _manual_hostports(self) -> set:
         return set((p["host"], int(p["port"])) for p in config.get_manual_peers())
 
-    def _expire_peers(self) -> None:
-        """Drop hello-sourced peers not seen for HELLO_EXPIRY. Manual peers
-        never expire (also protects hello records for configured host:ports)."""
+    # -- suspect verification (verify-before-drop) ---------------------------
+
+    def _mark_suspect(self, peer_id, reason) -> None:
+        """Move a record into SUSPECT (idempotent) and kick a background
+        verification probe. Publishes nothing — entering SUSPECT is invisible
+        to clients."""
+        with self._lock:
+            record = self._peers.get(peer_id)
+            if record is None:
+                return
+            if record.get("_suspect_since") is None:
+                record["_suspect_since"] = time.time()
+                log.debug("peer %s suspect (%s); removal suppressed pending "
+                          "verification", record.get("name"), reason)
+        self._schedule_probe(peer_id)
+
+    def _schedule_probe(self, peer_id) -> None:
+        """Submit a verification probe for a peer unless one is already in
+        flight or ran within PROBE_COOLDOWN (no thundering probes; the pool
+        caps concurrency at VERIFY_WORKERS)."""
+        if self._stop.is_set():
+            return
+        with self._lock:
+            record = self._peers.get(peer_id)
+            if record is None or peer_id in self._probing:
+                return
+            if time.time() - record.get("_last_probe", 0) < PROBE_COOLDOWN:
+                return
+            self._probing.add(peer_id)
+        try:
+            self._verify_pool.submit(self._verify_peer, peer_id)
+        except RuntimeError:  # pool shut down during daemon exit
+            with self._lock:
+                self._probing.discard(peer_id)
+
+    def _verify_peer(self, peer_id) -> None:
+        """Background verification probe: GET /api/ping on every known
+        address of the peer (short timeout each). An answer clears the
+        suspicion and confirms the answering host; a full miss records the
+        failure so _reap_peers() can remove the peer once SUSPECT_GRACE has
+        elapsed."""
+        try:
+            with self._lock:
+                record = self._peers.get(peer_id)
+                if record is None:
+                    return
+                hosts = [record.get("host")] \
+                    + list(record.get("addresses") or [])
+                port = int(record.get("port") or config.DEFAULT_PORT)
+                pname = record.get("name")
+            prober = self._prober or _ping_addr
+            alive_host = None
+            seen = set()
+            for host in hosts:
+                if not host or host in seen or self._stop.is_set():
+                    continue
+                seen.add(host)
+                if prober(host, port):
+                    alive_host = host
+                    break
+            now = time.time()
+            with self._lock:
+                record = self._peers.get(peer_id)
+                if record is None:
+                    return
+                record["_last_probe"] = now
+                record["_probe_ok"] = alive_host is not None
+            if alive_host is not None:
+                log.debug("suspect peer %s answered probe at %s:%d; keeping",
+                          pname, alive_host, port)
+                self.confirm_contact(peer_id, alive_host)
+            else:
+                log.debug("suspect peer %s failed probe on all addresses "
+                          "(%s); will remove after grace",
+                          pname, ", ".join(seen))
+        finally:
+            with self._lock:
+                self._probing.discard(peer_id)
+
+    def _reap_peers(self) -> None:
+        """The only place peers are ever removed. Non-manual peers whose
+        last sighting is older than HELLO_EXPIRY turn SUSPECT (verify before
+        expiring). A SUSPECT peer is removed only when ALL of:
+          - a verification probe issued after the suspicion failed,
+          - SUSPECT_GRACE has elapsed since it turned suspect,
+          - it hasn't answered any contact within CONTACT_FRESH.
+        Otherwise it stays listed and gets re-probed (cooldown-limited).
+        Manual peers (config.json) never expire."""
         now = time.time()
         manual = self._manual_hostports()
-        expired = []
+        removed, reprobe = [], []
         with self._lock:
             for peer_id, record in list(self._peers.items()):
-                if record.get("source") != "hello":
+                if record.get("source") == "manual":
                     continue
                 if (record.get("host"), int(record.get("port", 0))) in manual:
                     continue
-                if now - record.get("last_seen", 0) > HELLO_EXPIRY:
-                    expired.append(self._peers.pop(peer_id))
-        for record in expired:
-            log.info("peer expired: %s (%s)", record.get("name"),
-                     record.get("host"))
-        if expired:
+                suspect = record.get("_suspect_since")
+                if suspect is None:
+                    stale = now - record.get("last_seen", 0)
+                    if stale <= HELLO_EXPIRY:
+                        continue
+                    record["_suspect_since"] = suspect = now
+                    log.debug("peer %s stale (no sighting for %.0fs); "
+                              "verifying before expiry",
+                              record.get("name"), stale)
+                if (now - suspect >= SUSPECT_GRACE
+                        and now - record.get("_last_contact", 0) >= CONTACT_FRESH
+                        and record.get("_probe_ok") is False
+                        and record.get("_last_probe", 0) >= suspect):
+                    removed.append(self._peers.pop(peer_id))
+                else:
+                    reprobe.append(peer_id)
+        for peer_id in reprobe:
+            self._schedule_probe(peer_id)
+        for record in removed:
+            log.info("peer removed (verified gone): %s (%s)",
+                     record.get("name"), record.get("host"))
+        if removed:
             bus.publish("peers")
 
     def get_peers(self) -> list:
-        """Merged peer list from the unified registry.
+        """Merged peer list from the unified registry (bookkeeping fields
+        stripped). Suspect-but-unverified peers are still listed.
 
         Manual peers from config.json are probed live (short timeout) to learn
         id/name/platform; unreachable manual peers fall back to their last
         known record, or are skipped if they've never responded."""
-        self._expire_peers()
+        self._reap_peers()
         my_id = config.get_device_id()
 
-        known_hostports = set()
-        with self._lock:
-            for record in self._peers.values():
-                known_hostports.add((record["host"], int(record["port"])))
         for entry in config.get_manual_peers():
             # Probe manual entries we have no fresh record for (and re-probe
             # all manual entries to keep their info current).
             self._probe_manual(entry["host"], entry["port"])
 
         with self._lock:
-            peers = [dict(r, addresses=list(r.get("addresses") or []))
-                     for r in self._peers.values() if r["id"] != my_id]
+            peers = []
+            for r in self._peers.values():
+                if r["id"] == my_id:
+                    continue
+                pub = {k: v for k, v in r.items() if not k.startswith("_")}
+                pub["addresses"] = list(r.get("addresses") or [])
+                peers.append(pub)
         return sorted(peers, key=lambda p: p.get("name", ""))
 
     def _probe_manual(self, host: str, port: int):
@@ -502,7 +694,7 @@ class Discovery:
         # A round on start, then every HELLO_INTERVAL or whenever woken.
         while not self._stop.is_set():
             try:
-                self._expire_peers()
+                self._reap_peers()
                 self._send_hellos()
             except Exception as exc:  # never kill the loop
                 log.warning("hello round failed: %s", exc)
@@ -530,6 +722,7 @@ class Discovery:
             "platform": config.platform_name(),
             "version": __version__,
             "port": self.port,
+            "clip": _current_clip_id(),
         }
         with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
             pool.map(lambda t: self._send_hello(t[0], t[1], payload), targets)
@@ -560,7 +753,10 @@ class Discovery:
             platform=data.get("platform", "unknown"),
             version=data.get("version", "unknown"),
             source=source,
+            clip=(str(data.get("clip") or "") if "clip" in data else None),
         )
-        # The POST above actually reached `host` — that's confirmed contact
-        # (record_peer keeps a previously-confirmed host, which may differ).
+        # The POST above actually reached `host` — that's answered contact
+        # (record_peer keeps a previously-confirmed host, which may differ,
+        # and refreshes _last_contact so this peer stays fresh even if its
+        # own hellos never arrive here).
         self.confirm_contact(peer_id, host)

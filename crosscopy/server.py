@@ -255,13 +255,25 @@ def create_app(discovery=None, updater=None) -> Flask:
                 platform=body.get("platform", "unknown"),
                 version=body.get("version", "unknown"),
                 source="hello",
+                # "clip" = the sender's clipboard_id ("" when empty);
+                # record_peer publishes a "peers" event only when it (or
+                # membership/host/name/...) actually changed — periodic
+                # keep-alive hellos no longer spam SSE clients.
+                clip=(str(body.get("clip") or "") if "clip" in body else None),
             )
-        # Always publish: peers hello us when *their* state changes (e.g.
-        # their clipboard), so local clients should refetch even when the
-        # peer record itself is unchanged.
-        bus.publish("peers")
+        if "clip" not in body:
+            # Pre-0.4.2 senders don't say what changed; keep the legacy
+            # always-refetch behavior so their clipboard changes still
+            # propagate to our UIs.
+            log.debug("peers event published for legacy hello from %s (%s)",
+                      body.get("name") or peer_id, request.remote_addr)
+            bus.publish("peers")
         info = _device_info()
         info["port"] = config.get_port()
+        # Mirror our clipboard_id back so the *sender* can also detect our
+        # clipboard changes from its own outbound hellos.
+        manifest = clipboard.load_clipboard()
+        info["clip"] = str((manifest or {}).get("clipboard_id") or "")
         return jsonify(info)
 
     @app.get("/api/clipboard/meta")

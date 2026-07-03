@@ -8,6 +8,9 @@ pystray for a main thread.
 Usage:
     python -m crosscopy.popup offer <offer_id> [--slot N] [--dry-run]
     python -m crosscopy.popup info "<title>" "<body>" [--slot N] [--dry-run]
+    python -m crosscopy.popup share <peer_id> <clipboard_id> \
+        [--from-name NAME] [--summary TEXT] [--kind files|text] \
+        [--slot N] [--dry-run]
 
 stdlib only (tkinter + urllib).
 """
@@ -45,14 +48,19 @@ FONT = "Helvetica"
 
 OFFER_TIMEOUT_S = 300   # matches server-side offer TTL
 INFO_TIMEOUT_MS = 6000
+SHARE_TIMEOUT_MS = 60000  # clipboard-share cards auto-dismiss after 60 s
 POLL_MS = 2000
 MAX_POLL_FAILURES = 5   # consecutive daemon errors before giving up
+DEFAULT_RECEIVE_DIR = "~/Downloads/cross-copy"
+
+
+def crosscopy_home():
+    return os.environ.get("CROSSCOPY_HOME") or os.path.expanduser("~/.crosscopy")
 
 
 def daemon_port():
-    home = os.environ.get("CROSSCOPY_HOME") or os.path.expanduser("~/.crosscopy")
     try:
-        with open(os.path.join(home, "daemon.json")) as f:
+        with open(os.path.join(crosscopy_home(), "daemon.json")) as f:
             return int(json.load(f)["port"])
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -60,6 +68,21 @@ def daemon_port():
         return int(os.environ.get("CROSSCOPY_PORT", DEFAULT_PORT))
     except ValueError:
         return DEFAULT_PORT
+
+
+def receive_dir():
+    """Where "Save here" puts files: the daemon's configured receive_dir
+    (read from config.json — same machine, same home), expanded locally.
+    /api/paste requires an explicit absolute 'dest'."""
+    raw = None
+    try:
+        with open(os.path.join(crosscopy_home(), "config.json")) as f:
+            raw = json.load(f).get("receive_dir")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not raw or not isinstance(raw, str):
+        raw = DEFAULT_RECEIVE_DIR
+    return os.path.abspath(os.path.expanduser(raw))
 
 
 def api(path, body=None, timeout=10):
@@ -262,6 +285,72 @@ def run_offer(offer_id, slot):
     return 0
 
 
+def run_share(peer_id, clipboard_id, from_name, summary, kind, slot):
+    """Interactive card for a peer's newly shared clipboard:
+    "machine-b is sharing" + "3 files (2.1 MB)" with [Save here]/[Get text]
+    and [Dismiss]. Save posts /api/paste pinned to this peer+clipboard_id."""
+    ui = Popup(HEIGHT_OFFER, slot)
+    ui.label(18, 16, "%s is sharing" % from_name, size=12, bold=True)
+    ui.label(18, 40, summary, color=MUTED, size=10)
+    status_id = ui.label(18, 100, "", color=MUTED, size=10)
+
+    state = {"busy": False, "result": []}
+
+    def finish(message, color=OK, delay=2500):
+        for b in (save_btn, dismiss_btn):
+            b.place_forget()
+        ui.canvas.itemconfigure(status_id, text=message, fill=color)
+        ui.root.after(delay, ui.close)
+
+    def do_save():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        save_btn.configure(state="disabled", text="Saving…")
+        dismiss_btn.configure(state="disabled")
+        dest = receive_dir()
+        body = {"peer_id": peer_id, "clipboard_id": clipboard_id}
+        if kind != "text":  # text pastes ignore dest; files require it
+            body["dest"] = dest
+
+        def work():
+            state["result"].append(api("/api/paste", body=body, timeout=600))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll_result():
+            if not state["result"]:
+                ui.root.after(200, poll_result)
+                return
+            res = state["result"][0]
+            if res is None:
+                finish("Failed — see the cross-copy UI", color="#e46a76")
+            elif res.get("kind") == "text":
+                try:
+                    ui.root.clipboard_clear()
+                    ui.root.clipboard_append(res.get("text") or "")
+                    finish("Text copied to your clipboard")
+                except Exception:
+                    finish("Text received")
+            else:
+                finish("Saved to %s" % dest)
+        poll_result()
+
+    dismiss_btn = ui.button("Dismiss", ui.close)
+    save_btn = ui.button("Get text" if kind == "text" else "Save here",
+                         do_save, primary=True)
+    dismiss_btn.place(x=WIDTH - 178, y=HEIGHT_OFFER - 42, width=76, height=26)
+    save_btn.place(x=WIDTH - 98, y=HEIGHT_OFFER - 42, width=80, height=26)
+
+    def expire():
+        if not state["busy"]:  # never yank the card mid-save
+            ui.close()
+
+    ui.root.after(SHARE_TIMEOUT_MS, expire)
+    ui.run()
+    return 0
+
+
 def run_info(title, body, slot):
     ui = Popup(HEIGHT_INFO, slot)
     ui.label(18, 16, title, size=12, bold=True)
@@ -287,6 +376,15 @@ def dry_run(args):
             "body": offer_summary(offer) if offer else None,
             "buttons": ["Decline", "Accept"],
         }
+    elif args.mode == "share":
+        height = HEIGHT_OFFER
+        content = {
+            "title": "%s is sharing" % args.from_name,
+            "body": args.summary,
+            "buttons": ["Dismiss",
+                        "Get text" if args.kind == "text" else "Save here"],
+            "dest": receive_dir() if args.kind != "text" else None,
+        }
     else:
         height = HEIGHT_INFO
         content = {"title": args.title, "body": args.body, "buttons": []}
@@ -305,6 +403,12 @@ def main(argv=None):
     p = sub.add_parser("info")
     p.add_argument("title")
     p.add_argument("body")
+    p = sub.add_parser("share")
+    p.add_argument("peer_id")
+    p.add_argument("clipboard_id")
+    p.add_argument("--from-name", dest="from_name", default="peer")
+    p.add_argument("--summary", default="new shared content")
+    p.add_argument("--kind", choices=("files", "text"), default="files")
     for p in sub.choices.values():
         p.add_argument("--slot", type=int, default=0)
         p.add_argument("--dry-run", action="store_true")
@@ -325,6 +429,9 @@ def main(argv=None):
     try:
         if args.mode == "offer":
             return run_offer(args.offer_id, max(0, args.slot))
+        if args.mode == "share":
+            return run_share(args.peer_id, args.clipboard_id, args.from_name,
+                             args.summary, args.kind, max(0, args.slot))
         return run_info(args.title, args.body, max(0, args.slot))
     except Exception as e:  # no display / WM quirks — never hard-crash
         print("crosscopy.popup: could not show popup: %s" % e, file=sys.stderr)
