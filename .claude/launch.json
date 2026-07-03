@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "crosscopy-daemon",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "crosscopy.daemon"],
+      "port": 7373
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>cross-copy</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="reconnect-banner" class="reconnect-banner hidden">
+    <span class="spinner"></span> Lost connection to the daemon &mdash; reconnecting&hellip;
+  </div>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-mark">&#10697;</span>
+        <h1>cross-copy</h1>
+      </div>
+      <div class="device-meta">
+        <span id="device-name" class="device-name">&mdash;</span>
+        <span id="device-platform" class="device-platform"></span>
+        <span id="daemon-version" class="daemon-version"></span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- This device's clipboard -->
+    <section class="card" id="local-card">
+      <div class="card-head">
+        <h2>This device's clipboard</h2>
+        <div class="card-head-actions">
+          <span id="local-op-badge" class="op-badge hidden"></span>
+          <button id="clear-btn" class="btn btn-ghost hidden" type="button">Clear</button>
+        </div>
+      </div>
+
+      <div id="local-clipboard">
+        <p class="empty-state">Clipboard is empty. Use <code>ccp copy &lt;file&gt;</code> or drop files below.</p>
+      </div>
+
+      <div id="drop-zone" class="drop-zone" tabindex="0">
+        <div class="drop-zone-inner">
+          <span class="drop-icon">&#8682;</span>
+          <p>Drag &amp; drop files here, or</p>
+          <button id="pick-btn" class="btn btn-primary" type="button">Copy files from this browser</button>
+          <input type="file" id="file-input" multiple hidden>
+        </div>
+        <div id="upload-progress" class="upload-progress hidden">
+          <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
+          <span id="progress-label" class="progress-label">Uploading&hellip;</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Peers -->
+    <section class="peers-section">
+      <div class="section-head">
+        <h2>Devices on your network</h2>
+        <label class="dest-field">
+          <span>Paste destination</span>
+          <input type="text" id="dest-input" placeholder="/absolute/destination/path"
+                 spellcheck="false" autocomplete="off">
+        </label>
+      </div>
+      <div id="peers-list" class="peers-list">
+        <p class="empty-state">Looking for devices&hellip;</p>
+      </div>
+    </section>
+
+    <!-- Add device manually -->
+    <section class="card add-device-card">
+      <div class="card-head">
+        <h2>Add device manually</h2>
+      </div>
+      <p class="hint">For networks where mDNS discovery is blocked.</p>
+      <form id="add-peer-form" class="add-peer-form">
+        <input type="text" id="peer-host" placeholder="192.168.1.5" required
+               spellcheck="false" autocomplete="off" aria-label="Host">
+        <input type="number" id="peer-port" value="7373" min="1" max="65535" aria-label="Port">
+        <button type="submit" class="btn btn-primary" id="add-peer-btn">Add</button>
+      </form>
+    </section>
+
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
