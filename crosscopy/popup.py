@@ -2,8 +2,18 @@
 
 The tray widget's own notification system: small always-on-top cards with
 real Accept/Decline buttons, replacing OS notification-center toasts.
-Each popup runs as its own short-lived process so tkinter never fights
-pystray for a main thread.
+Each popup runs as its own short-lived process so no GUI toolkit ever
+fights pystray for a main thread.
+
+Backends:
+  darwin  — native AppKit cards (borderless non-activating NSPanel).
+            tkinter `overrideredirect` windows are notoriously broken on
+            aqua Tk (frameless windows often never appear or can't take
+            clicks), so macOS renders each card with PyObjC instead
+            (guaranteed present there: pystray depends on it).
+  other   — tkinter (verified working on Linux WMs).
+Last resort (no backend could show a window): a plain OS notification via
+crosscopy.notify's platform helpers, so the user is never left in silence.
 
 Usage:
     python -m crosscopy.popup offer <offer_id> [--slot N] [--dry-run]
@@ -12,7 +22,7 @@ Usage:
         [--from-name NAME] [--summary TEXT] [--kind files|text] \
         [--slot N] [--dry-run]
 
-stdlib only (tkinter + urllib).
+stdlib only (tkinter + urllib), plus PyObjC on macOS.
 """
 
 import argparse
@@ -25,13 +35,19 @@ import urllib.request
 
 DEFAULT_PORT = 7373
 
-# Card geometry (px)
+# Card geometry (px) — tkinter backend
 WIDTH = 340
 HEIGHT_OFFER = 132
 HEIGHT_INFO = 88
 MARGIN = 16          # gap from the screen's top/right edges
 GAP = 12             # vertical gap between stacked cards
 RADIUS = 16
+
+# Card geometry (pt) — AppKit backend (native controls need more room)
+MAC_WIDTH = 360
+MAC_HEIGHT_OFFER = 150
+MAC_HEIGHT_INFO = 96
+MAC_RADIUS = 14.0
 
 # Liquid-glass-inspired palette (within tkinter's limits: flat dark card,
 # soft top highlight line, brand accent; -alpha translucency when the WM
@@ -44,7 +60,10 @@ ACCENT_ACTIVE = "#1e5cd6"
 TEXT = "#edf1fa"
 MUTED = "#9aa3b5"
 OK = "#3ecf7a"
+FAIL = "#e46a76"
 FONT = "Helvetica"
+
+FAIL_TEXT = "Failed — see the cross-copy UI"
 
 OFFER_TIMEOUT_S = 300   # matches server-side offer TTL
 INFO_TIMEOUT_MS = 6000
@@ -53,6 +72,10 @@ POLL_MS = 2000
 MAX_POLL_FAILURES = 5   # consecutive daemon errors before giving up
 DEFAULT_RECEIVE_DIR = "~/Downloads/cross-copy"
 
+
+# ---------------------------------------------------------------------------
+# Shared plumbing (both backends + --dry-run)
+# ---------------------------------------------------------------------------
 
 def crosscopy_home():
     return os.environ.get("CROSSCOPY_HOME") or os.path.expanduser("~/.crosscopy")
@@ -110,6 +133,11 @@ def fetch_offer(offer_id):
     return None
 
 
+def offer_title(offer):
+    frm = ((offer or {}).get("from") or {}).get("name") or "another device"
+    return "%s wants to send" % frm
+
+
 def offer_summary(offer):
     if offer.get("kind") == "text":
         text = offer.get("text") or ""
@@ -128,11 +156,31 @@ def offer_summary(offer):
     return "%d file%s · %s" % (len(files), "" if len(files) == 1 else "s", size)
 
 
-def geometry(height, slot, screen_w, screen_h=None):
-    x = screen_w - WIDTH - MARGIN
-    y = MARGIN + slot * (HEIGHT_OFFER + GAP)
-    return WIDTH, height, x, y
+def saved_message(res, fallback_dest=None):
+    """Status line after a successful files accept/paste."""
+    files = (res or {}).get("files_written") or []
+    if files:
+        return "Saved to %s" % os.path.dirname(files[0])
+    return "Saved to %s" % (fallback_dest or "receive folder")
 
+
+def slot_offset(slot, step=None):
+    """Vertical offset (from the top screen edge) of a card in `slot`."""
+    if step is None:
+        step = HEIGHT_OFFER + GAP
+    return MARGIN + slot * step
+
+
+def geometry(height, slot, screen_w, screen_h=None, width=WIDTH, step=None):
+    """Top-left-origin (w, h, x, y) for a card of `height` in `slot`."""
+    x = screen_w - width - MARGIN
+    y = slot_offset(slot, step)
+    return width, height, x, y
+
+
+# ---------------------------------------------------------------------------
+# tkinter backend (Linux and any non-darwin platform)
+# ---------------------------------------------------------------------------
 
 def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
     pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
@@ -198,10 +246,9 @@ def run_offer(offer_id, slot):
     offer = fetch_offer(offer_id)
     if not offer:
         return 0  # already resolved/expired — nothing to show
-    frm = (offer.get("from") or {}).get("name") or "another device"
 
     ui = Popup(HEIGHT_OFFER, slot)
-    ui.label(18, 16, "%s wants to send" % frm, size=12, bold=True)
+    ui.label(18, 16, offer_title(offer), size=12, bold=True)
     ui.label(18, 40, offer_summary(offer), color=MUTED, size=10)
     status_id = ui.label(18, 100, "", color=MUTED, size=10)
 
@@ -232,7 +279,7 @@ def run_offer(offer_id, slot):
                 return
             res = state["result"][0]
             if res is None:
-                finish("Failed — see the cross-copy UI", color="#e46a76")
+                finish(FAIL_TEXT, color=FAIL)
             elif res.get("kind") == "text":
                 text = res.get("text") or ""
                 try:
@@ -242,9 +289,7 @@ def run_offer(offer_id, slot):
                 except Exception:
                     finish("Text received")
             else:
-                files = res.get("files_written") or []
-                dest = os.path.dirname(files[0]) if files else "receive folder"
-                finish("Saved to %s" % dest)
+                finish(saved_message(res))
         poll_result()
 
     def do_decline():
@@ -324,7 +369,7 @@ def run_share(peer_id, clipboard_id, from_name, summary, kind, slot):
                 return
             res = state["result"][0]
             if res is None:
-                finish("Failed — see the cross-copy UI", color="#e46a76")
+                finish(FAIL_TEXT, color=FAIL)
             elif res.get("kind") == "text":
                 try:
                     ui.root.clipboard_clear()
@@ -333,7 +378,7 @@ def run_share(peer_id, clipboard_id, from_name, summary, kind, slot):
                 except Exception:
                     finish("Text received")
             else:
-                finish("Saved to %s" % dest)
+                finish(saved_message(res, dest))
         poll_result()
 
     dismiss_btn = ui.button("Dismiss", ui.close)
@@ -362,17 +407,450 @@ def run_info(title, body, slot):
     return 0
 
 
+def run_tk(args):
+    """tkinter backend entry point (raises when tkinter/display is broken
+    so main() can fall back)."""
+    import tkinter  # noqa: F401 — fail fast, before any daemon traffic
+    if args.mode == "offer":
+        return run_offer(args.offer_id, args.slot)
+    if args.mode == "share":
+        return run_share(args.peer_id, args.clipboard_id, args.from_name,
+                         args.summary, args.kind, args.slot)
+    return run_info(args.title, args.body, args.slot)
+
+
+# ---------------------------------------------------------------------------
+# AppKit backend (macOS) — PyObjC, one NSPanel card per process.
+#
+# Deliberately conservative bridging: only target/selector timers and
+# actions (no block APIs except NSOperationQueue.addOperationWithBlock_,
+# which macpanel.py already uses in production on macOS).
+# ---------------------------------------------------------------------------
+
+def run_mac(args):
+    import AppKit
+    import Foundation
+
+    # ----- bridging helpers -------------------------------------------------
+
+    def ns_color(hex_color, alpha=1.0):
+        r = int(hex_color[1:3], 16) / 255.0
+        g = int(hex_color[3:5], 16) / 255.0
+        b = int(hex_color[5:7], 16) / 255.0
+        return AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            r, g, b, alpha)
+
+    def dispatch_main(fn):
+        """Run `fn` on the AppKit main thread (UI must never be touched
+        from our HTTP worker threads)."""
+        AppKit.NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
+
+    class _Callback(Foundation.NSObject):
+        """Generic target for NSButton actions and NSTimers: invokes the
+        plain-Python callable stashed on the instance. Selector-based
+        (universally bridged), no block APIs."""
+
+        def invoke_(self, sender):  # selector "invoke:" — sender/timer arg
+            cb = getattr(self, "callback", None)
+            if cb is not None:
+                cb()
+
+    class _CardPanel(AppKit.NSPanel):
+        # Borderless windows refuse key status by default; allow it so the
+        # buttons behave like normal controls.
+        def canBecomeKeyWindow(self):
+            return True
+
+    class _CardButton(AppKit.NSButton):
+        def acceptsFirstMouse_(self, event):
+            return True  # first click hits the button even if not key
+
+    class _ClickView(AppKit.NSView):
+        """Content view for info cards: click anywhere dismisses."""
+
+        def mouseDown_(self, event):
+            AppKit.NSApp().terminate_(None)
+
+    app = AppKit.NSApplication.sharedApplication()
+    # Accessory: no Dock icon, no menu bar takeover — it's a toast card.
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+
+    keep = []  # strong refs: NSButton does NOT retain its target
+
+    def make_target(fn):
+        target = _Callback.alloc().init()
+        target.callback = fn
+        keep.append(target)
+        return target
+
+    def start_timer(seconds, fn, repeats=False):
+        t = (AppKit.NSTimer.
+             scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                 float(seconds), make_target(fn), "invoke:", None,
+                 bool(repeats)))
+        keep.append(t)
+        return t
+
+    def close_app():
+        app.terminate_(None)
+
+    def copy_text_to_pasteboard(text):
+        try:
+            pb = AppKit.NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+            return True
+        except Exception:
+            return False
+
+    # ----- card window --------------------------------------------------
+
+    class MacCard(object):
+        def __init__(self, height, slot, click_dismiss=False):
+            width = MAC_WIDTH
+            screen = AppKit.NSScreen.mainScreen()
+            if screen is not None:
+                vis = screen.visibleFrame()
+                right = vis.origin.x + vis.size.width
+                top = vis.origin.y + vis.size.height
+            else:
+                right, top = 1440.0, 900.0
+            # Same slot math as the tkinter backend, converted to AppKit's
+            # bottom-left origin.
+            y_off = slot_offset(slot, MAC_HEIGHT_OFFER + GAP)
+            x = right - width - MARGIN
+            y = top - y_off - height
+
+            style = AppKit.NSWindowStyleMaskBorderless
+            try:  # clicks shouldn't steal focus from the user's app
+                style |= AppKit.NSWindowStyleMaskNonactivatingPanel
+            except AttributeError:
+                pass
+            win = (_CardPanel.alloc().
+                   initWithContentRect_styleMask_backing_defer_(
+                       Foundation.NSMakeRect(x, y, width, height), style,
+                       AppKit.NSBackingStoreBuffered, False))
+            win.setLevel_(AppKit.NSStatusWindowLevel)
+            win.setOpaque_(False)
+            win.setBackgroundColor_(AppKit.NSColor.clearColor())
+            win.setHasShadow_(True)
+            win.setReleasedWhenClosed_(False)
+            try:  # show over full-screen apps / every Space
+                win.setCollectionBehavior_(
+                    AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                    | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary)
+            except AttributeError:
+                pass
+            try:  # dark controls regardless of the system theme (10.14+)
+                win.setAppearance_(AppKit.NSAppearance.appearanceNamed_(
+                    AppKit.NSAppearanceNameDarkAqua))
+            except Exception:
+                pass
+
+            view_cls = _ClickView if click_dismiss else AppKit.NSView
+            view = view_cls.alloc().initWithFrame_(
+                Foundation.NSMakeRect(0, 0, width, height))
+            view.setWantsLayer_(True)
+            layer = view.layer()
+            if layer is not None:  # rounded dark glass card
+                layer.setCornerRadius_(MAC_RADIUS)
+                layer.setMasksToBounds_(True)
+                layer.setBackgroundColor_(ns_color(CARD, 0.92).CGColor())
+                layer.setBorderWidth_(1.0)
+                layer.setBorderColor_(ns_color(CARD_HI, 0.9).CGColor())
+            win.setContentView_(view)
+
+            self.win = win
+            self.view = view
+            self.width = width
+            self.height = height
+            keep.append(win)
+            keep.append(view)
+
+        def label(self, x, y_top, w, h, text, color=TEXT, size=11,
+                  bold=False, wraps=False):
+            """Static text at (x, y_top) measured from the card's top edge."""
+            field = AppKit.NSTextField.alloc().initWithFrame_(
+                Foundation.NSMakeRect(x, self.height - y_top - h, w, h))
+            field.setStringValue_(str(text))
+            field.setBezeled_(False)
+            field.setBordered_(False)
+            field.setDrawsBackground_(False)
+            field.setEditable_(False)
+            field.setSelectable_(False)
+            field.setTextColor_(ns_color(color))
+            field.setFont_(AppKit.NSFont.boldSystemFontOfSize_(size) if bold
+                           else AppKit.NSFont.systemFontOfSize_(size))
+            cell = field.cell()
+            if cell is not None:
+                if wraps:
+                    cell.setWraps_(True)
+                else:
+                    cell.setWraps_(False)
+                    cell.setLineBreakMode_(AppKit.NSLineBreakByTruncatingTail)
+            self.view.addSubview_(field)
+            keep.append(field)
+            return field
+
+        def set_status(self, field, message, color):
+            field.setStringValue_(message)
+            field.setTextColor_(ns_color(color))
+
+        def button(self, title, fn, x, width=84, primary=False):
+            btn = _CardButton.alloc().initWithFrame_(
+                Foundation.NSMakeRect(x, 12, width, 28))
+            btn.setTitle_(title)
+            try:
+                btn.setBezelStyle_(AppKit.NSBezelStyleRounded)
+            except AttributeError:  # very old PyObjC constant name
+                btn.setBezelStyle_(AppKit.NSRoundedBezelStyle)
+            btn.setFont_(AppKit.NSFont.systemFontOfSize_(12))
+            btn.setTarget_(make_target(fn))
+            btn.setAction_("invoke:")
+            if primary:
+                btn.setKeyEquivalent_("\r")  # default (accent-tinted) button
+            self.view.addSubview_(btn)
+            keep.append(btn)
+            return btn
+
+        def show(self):
+            # No makeKey / no app activation: appear like a notification,
+            # never steal the user's focus.
+            self.win.orderFrontRegardless()
+
+    # ----- modes ---------------------------------------------------------
+
+    slot = args.slot
+
+    def mac_offer():
+        offer = fetch_offer(args.offer_id)
+        if not offer:
+            return 0  # already resolved/expired — nothing to show
+        offer_id = args.offer_id
+
+        card = MacCard(MAC_HEIGHT_OFFER, slot)
+        card.label(18, 14, MAC_WIDTH - 36, 20, offer_title(offer),
+                   size=13, bold=True)
+        card.label(18, 38, MAC_WIDTH - 36, 34, offer_summary(offer),
+                   color=MUTED, size=11, wraps=True)
+        status = card.label(18, MAC_HEIGHT_OFFER - 34, MAC_WIDTH - 36, 18,
+                            "", color=MUTED, size=11)
+
+        state = {"busy": False, "failures": 0, "polling": False}
+
+        def finish(message, color=OK, delay=2.0):
+            accept_btn.setHidden_(True)
+            decline_btn.setHidden_(True)
+            card.set_status(status, message, color)
+            start_timer(delay, close_app)
+
+        def do_accept():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            accept_btn.setEnabled_(False)
+            accept_btn.setTitle_("Saving…")
+            decline_btn.setEnabled_(False)
+
+            def work():  # HTTP off the main thread; UI back on it
+                res = api("/api/offers/%s/accept" % offer_id, body={},
+                          timeout=600)
+
+                def apply():
+                    if res is None:
+                        finish(FAIL_TEXT, color=FAIL)
+                    elif res.get("kind") == "text":
+                        ok = copy_text_to_pasteboard(res.get("text") or "")
+                        finish("Text copied to your clipboard" if ok
+                               else "Text received")
+                    else:
+                        finish(saved_message(res))
+                dispatch_main(apply)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def do_decline():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            accept_btn.setEnabled_(False)
+            decline_btn.setEnabled_(False)
+
+            def work():
+                api("/api/offers/%s/decline" % offer_id, body={}, timeout=10)
+                dispatch_main(close_app)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        decline_btn = card.button("Decline", do_decline, MAC_WIDTH - 184)
+        accept_btn = card.button("Accept", do_accept, MAC_WIDTH - 96,
+                                 primary=True)
+
+        def watch():
+            """Auto-close when the offer disappears (resolved elsewhere or
+            expired). Same tolerance rules as the tkinter backend."""
+            if state["busy"] or state["polling"]:
+                return
+            state["polling"] = True
+
+            def work():
+                data = api("/api/offers", timeout=4)
+
+                def apply():
+                    state["polling"] = False
+                    if state["busy"]:
+                        return
+                    if data is None:
+                        state["failures"] += 1
+                        if state["failures"] >= MAX_POLL_FAILURES:
+                            close_app()
+                    else:
+                        state["failures"] = 0
+                        ids = [o.get("offer_id")
+                               for o in data.get("offers") or []]
+                        if offer_id not in ids:
+                            close_app()
+                dispatch_main(apply)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        start_timer(POLL_MS / 1000.0, watch, repeats=True)
+        start_timer(OFFER_TIMEOUT_S, close_app)
+        card.show()
+        app.run()
+        return 0
+
+    def mac_share():
+        card = MacCard(MAC_HEIGHT_OFFER, slot)
+        card.label(18, 14, MAC_WIDTH - 36, 20, "%s is sharing" % args.from_name,
+                   size=13, bold=True)
+        card.label(18, 38, MAC_WIDTH - 36, 34, args.summary,
+                   color=MUTED, size=11, wraps=True)
+        status = card.label(18, MAC_HEIGHT_OFFER - 34, MAC_WIDTH - 36, 18,
+                            "", color=MUTED, size=11)
+
+        state = {"busy": False}
+
+        def finish(message, color=OK, delay=2.5):
+            save_btn.setHidden_(True)
+            dismiss_btn.setHidden_(True)
+            card.set_status(status, message, color)
+            start_timer(delay, close_app)
+
+        def do_save():
+            if state["busy"]:
+                return
+            state["busy"] = True
+            save_btn.setEnabled_(False)
+            save_btn.setTitle_("Saving…")
+            dismiss_btn.setEnabled_(False)
+            dest = receive_dir()
+            body = {"peer_id": args.peer_id, "clipboard_id": args.clipboard_id}
+            if args.kind != "text":  # text pastes ignore dest; files need it
+                body["dest"] = dest
+
+            def work():
+                res = api("/api/paste", body=body, timeout=600)
+
+                def apply():
+                    if res is None:
+                        finish(FAIL_TEXT, color=FAIL)
+                    elif res.get("kind") == "text":
+                        ok = copy_text_to_pasteboard(res.get("text") or "")
+                        finish("Text copied to your clipboard" if ok
+                               else "Text received")
+                    else:
+                        finish(saved_message(res, dest))
+                dispatch_main(apply)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        dismiss_btn = card.button("Dismiss", close_app, MAC_WIDTH - 192,
+                                  width=86)
+        save_btn = card.button(
+            "Get text" if args.kind == "text" else "Save here",
+            do_save, MAC_WIDTH - 102, width=88, primary=True)
+
+        def expire():
+            if not state["busy"]:  # never yank the card mid-save
+                close_app()
+
+        start_timer(SHARE_TIMEOUT_MS / 1000.0, expire)
+        card.show()
+        app.run()
+        return 0
+
+    def mac_info():
+        card = MacCard(MAC_HEIGHT_INFO, slot, click_dismiss=True)
+        card.label(18, 14, MAC_WIDTH - 36, 20, args.title, size=13, bold=True)
+        card.label(18, 38, MAC_WIDTH - 36, 40, args.body, color=MUTED,
+                   size=11, wraps=True)
+        start_timer(INFO_TIMEOUT_MS / 1000.0, close_app)
+        card.show()
+        app.run()
+        return 0
+
+    if args.mode == "offer":
+        return mac_offer()
+    if args.mode == "share":
+        return mac_share()
+    return mac_info()
+
+
+# ---------------------------------------------------------------------------
+# Last-resort fallback: plain OS notification (osascript / notify-send).
+# We reuse crosscopy.notify's platform helpers *directly*, bypassing its
+# widget-connected suppression — we ARE the widget's popup, so if we can't
+# draw a card the OS toast is the only voice left.
+# ---------------------------------------------------------------------------
+
+def fallback_text(args):
+    """(title, body) for the OS-notification fallback, or None when there
+    is nothing worth announcing (offer already gone)."""
+    if args.mode == "offer":
+        offer = fetch_offer(args.offer_id)
+        if not offer:
+            return None  # resolved/expired — a toast would be noise
+        return ("cross-copy",
+                "%s %s — accept in the cross-copy UI or run 'ccp accept'."
+                % (offer_title(offer), offer_summary(offer)))
+    if args.mode == "share":
+        return ("cross-copy",
+                "%s is sharing %s — get it with 'ccp paste'."
+                % (args.from_name, args.summary))
+    return (args.title, args.body)
+
+
+def fallback_os_notification(title, body):
+    """Fire a plain OS notification. True when a helper was invoked."""
+    try:
+        if sys.platform == "darwin":
+            from crosscopy.notify import _notify_macos
+            _notify_macos(title, body)
+            return True
+        if sys.platform.startswith("linux"):
+            from crosscopy.notify import _notify_linux
+            _notify_linux(title, body)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# --dry-run + entry point
+# ---------------------------------------------------------------------------
+
 def dry_run(args):
     """Print the computed content/geometry as JSON instead of showing a
-    window (for headless testing)."""
+    window (for headless testing). Platform-independent (tkinter metrics)."""
     screen_w, screen_h = 1920, 1080
     if args.mode == "offer":
         offer = fetch_offer(args.offer_id)
         height = HEIGHT_OFFER
         content = {
             "found": bool(offer),
-            "title": "%s wants to send" % ((offer or {}).get("from", {})
-                                           .get("name") or "another device"),
+            "title": offer_title(offer or {}),
             "body": offer_summary(offer) if offer else None,
             "buttons": ["Decline", "Accept"],
         }
@@ -416,26 +894,36 @@ def main(argv=None):
     if not args.mode:
         parser.print_help()
         return 2
+    args.slot = max(0, args.slot)
 
     if args.dry_run:
         return dry_run(args)
 
-    try:
-        import tkinter  # noqa: F401
-    except ImportError:
-        print("crosscopy.popup: tkinter is not available "
-              "(install your platform's python3-tk package).", file=sys.stderr)
-        return 1
-    try:
-        if args.mode == "offer":
-            return run_offer(args.offer_id, max(0, args.slot))
-        if args.mode == "share":
-            return run_share(args.peer_id, args.clipboard_id, args.from_name,
-                             args.summary, args.kind, max(0, args.slot))
-        return run_info(args.title, args.body, max(0, args.slot))
-    except Exception as e:  # no display / WM quirks — never hard-crash
-        print("crosscopy.popup: could not show popup: %s" % e, file=sys.stderr)
-        return 1
+    # Backend chain: native AppKit on macOS (tkinter overrideredirect is
+    # broken on aqua Tk), tkinter everywhere else / as the macOS fallback,
+    # and finally a plain OS notification so the user is never left silent.
+    backends = []
+    if sys.platform == "darwin":
+        backends.append(("AppKit", run_mac))
+    backends.append(("tkinter", run_tk))
+
+    errors = []
+    for name, runner in backends:
+        try:
+            return runner(args)
+        except Exception as e:
+            errors.append("%s backend failed: %r" % (name, e))
+
+    for msg in errors:  # stderr lands in widget.log via spawn_popup
+        print("crosscopy.popup: %s" % msg, file=sys.stderr)
+    text = fallback_text(args)
+    if text and fallback_os_notification(*text):
+        print("crosscopy.popup: fell back to an OS notification",
+              file=sys.stderr)
+        return 0
+    print("crosscopy.popup: could not show a popup card or an OS "
+          "notification.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

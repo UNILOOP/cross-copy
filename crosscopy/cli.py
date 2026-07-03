@@ -282,8 +282,43 @@ def terminate_pid(pid, wait=5.0):
     return None
 
 
+def probe_orphan_daemon():
+    """(answering, pid) for whatever is serving our port right now.
+
+    `answering` — something responds to /api/ping; `pid` — the pid that
+    daemon reports in /api/status (daemons >= 0.4.2), else None. Used when
+    daemon.json is missing/stale but the port is still taken: an orphaned
+    old daemon that would otherwise silently keep serving stale code while
+    every freshly-installed daemon dies failing to bind."""
+    if not ping():
+        return False, None
+    pid = None
+    try:
+        r = requests.get(base_url() + "/api/status", timeout=5)
+        if r.ok:
+            pid = r.json().get("pid")
+    except (requests.RequestException, ValueError):
+        pass
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        pid = None
+    return True, (pid if pid and pid > 0 else None)
+
+
+def lsof_hint():
+    return "lsof -nP -iTCP:%d -sTCP:LISTEN" % daemon_port()
+
+
 def stop_running_daemon():
-    """Best-effort stop of a running daemon (via daemon.json). Dies on failure."""
+    """Best-effort stop of a running daemon. Dies on failure to stop a
+    known pid.
+
+    Prefers daemon.json's pid. When that is missing or dead but the port
+    still answers, an ORPHANED daemon holds it (old install whose pidfile
+    was lost/overwritten) — fall back to the pid the daemon itself reports
+    via /api/status. Pre-0.4.2 daemons don't report one: warn loudly with
+    an lsof hint instead of pretending the port is free."""
     info = read_daemon_json()
     pid = (info or {}).get("pid")
     try:
@@ -296,6 +331,24 @@ def stop_running_daemon():
         error = terminate_pid(pid)
         if error:
             die(error + "\nStop it manually, then re-run 'ccp daemon install'.")
+        return
+    answering, orphan_pid = probe_orphan_daemon()
+    if not answering:
+        return
+    if orphan_pid and pid_alive(orphan_pid):
+        print("Stopping an orphaned daemon on port %d (pid %d, found via "
+              "/api/status)..." % (daemon_port(), orphan_pid))
+        error = terminate_pid(orphan_pid)
+        if error:
+            die(error + "\nStop it manually, then re-run 'ccp daemon install'.")
+        return
+    err("⚠️  A daemon is answering on port %d, but it reports no pid (an "
+        "older version)" % daemon_port())
+    err("   and %s does not point at it — it cannot be stopped "
+        "automatically." % os.path.join(crosscopy_home(), "daemon.json"))
+    err("   The new daemon will not be able to bind the port until it is "
+        "gone.")
+    err("   Find and stop it manually: %s" % lsof_hint())
 
 
 def run_cmd(cmd):
@@ -1007,6 +1060,9 @@ def cmd_status(args):
         else:
             hint = "run 'ccp update'"
         print("⬆️  Update v%s available — %s" % (update["latest"], hint))
+    # Split-environment detection: the daemon serving this port may be
+    # running older code than the locally installed package.
+    warn_version_mismatch(status.get("version"))
 
 
 def cmd_clear(args):
@@ -1118,12 +1174,73 @@ def run_self_update():
                if tail else ""))
 
 
-def restart_daemon_after_update():
+def daemon_process_command(pid):
+    """Best-effort command line of a pid (`ps -p <pid> -o command=`,
+    works on macOS and Linux). None when unavailable."""
+    try:
+        proc = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, timeout=5)
+        return (proc.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def warn_version_mismatch(daemon_version, orphan_hint=False):
+    """One-line heads-up when the running daemon's version differs from
+    this CLI's. Quiet when they match or either is unknown. With
+    orphan_hint (after start/install, when the daemon we *just* started
+    should match), also point at the likely cause: an orphaned old daemon
+    still holding the port."""
+    if not daemon_version or daemon_version == __version__:
+        return
+    err("⚠️  Daemon is running v%s but v%s is installed — restart it: "
+        "ccp daemon stop && ccp daemon start "
+        "(if this persists: ccp daemon uninstall && ccp daemon install)"
+        % (daemon_version, __version__))
+    if orphan_hint:
+        err("   An orphaned old daemon may still be holding port %d — "
+            "check with: %s" % (daemon_port(), lsof_hint()))
+
+
+def check_daemon_version_after_update(info, expected):
+    """After `ccp update` restarted the daemon, verify it actually loaded
+    the new code. A mismatch means the daemon process runs from a DIFFERENT
+    Python environment than this CLI (old venv in the service definition,
+    stale spawn, ...). Loud but non-fatal; quiet when versions match.
+
+    Compares against `expected` (the just-installed version), NOT
+    __version__ — this CLI process still has the pre-update module loaded.
+    """
+    daemon_v = (info or {}).get("version")
+    if not daemon_v or not expected or daemon_v == expected:
+        return
+    err("")
+    err("⚠️  The daemon came back reporting v%s, but v%s was just installed."
+        % (daemon_v, expected))
+    err("   It is most likely running from a different Python environment "
+        "than this")
+    err("   'ccp' (e.g. an old venv baked into its launchd/systemd service "
+        "definition).")
+    pid = (info or {}).get("pid") or (read_daemon_json() or {}).get("pid")
+    cmdline = daemon_process_command(pid) if pid else None
+    if cmdline:
+        err("   Daemon process: %s" % cmdline)
+    err("   Another possibility: an orphaned old daemon still holds port "
+        "%d — check with:" % daemon_port())
+    err("   %s" % lsof_hint())
+    err("   Fix: ccp daemon uninstall && ccp daemon install")
+    err("        (rewrites the service to use this environment — or rerun "
+        "install.sh)")
+
+
+def restart_daemon_after_update(expected_version=None):
     """Stop the running daemon so the new code loads.
 
     If a systemd/launchd service is installed, its Restart/KeepAlive policy
     brings the daemon back by itself — poll ping briefly and only spawn one
-    manually if nothing came back.
+    manually if nothing came back. Once it's back, verify it reports the
+    just-installed version (split-environment detection).
     """
     info = read_daemon_json()
     pid = (info or {}).get("pid")
@@ -1138,12 +1255,61 @@ def restart_daemon_after_update():
             err("Restart it manually to load the new version: "
                 "ccp daemon stop && ccp daemon start")
             return
-    if wait_for_ping(3.0):  # service manager restarted it
-        return
-    spawn_daemon()
-    if not wait_for_ping():
+    back = wait_for_ping(3.0)  # service manager may restart it by itself
+    if not back:
+        spawn_daemon()
+        back = wait_for_ping()
+    if not back:
         err("The daemon did not come back after the update. "
             "Start it with 'ccp daemon start'.")
+        return
+    check_daemon_version_after_update(back, expected_version)
+
+
+def read_widget_pid():
+    """pid from ~/.crosscopy/widget.json, or None."""
+    try:
+        with open(os.path.join(crosscopy_home(), "widget.json")) as f:
+            return int(json.load(f)["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def restart_widget_after_update(quiet=False):
+    """If a tray widget is running, restart it so it loads the new code
+    (without this, Macs keep running the old widget — and its old popup
+    backend — after every update). Best-effort: never fatal.
+
+    After SIGTERM we briefly poll for a NEW live pid in widget.json: the
+    macOS launchd widget agent has KeepAlive and respawns it on its own —
+    only spawn one ourselves when nothing came back.
+    """
+    try:
+        pid = read_widget_pid()
+        if not pid or not pid_alive(pid):
+            return  # no widget running — nothing to restart
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        deadline = time.time() + 2.0
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.1)
+        respawned = False
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            new_pid = read_widget_pid()
+            if new_pid and new_pid != pid and pid_alive(new_pid):
+                respawned = True  # launchd/autostart brought it back
+                break
+            time.sleep(0.2)
+        if not respawned:
+            spawn_widget()
+        if not quiet:
+            print("🔄 Tray widget restarted.")
+    except Exception as e:
+        err("Could not restart the tray widget (%s) — restart it manually "
+            "with 'ccp widget'." % e)
 
 
 def cmd_update(args):
@@ -1180,7 +1346,8 @@ def cmd_update(args):
     if was_running:
         if not args.json:
             print("Restarting the daemon to load the new version...")
-        restart_daemon_after_update()
+        restart_daemon_after_update(expected_version=latest)
+    restart_widget_after_update(quiet=args.json)
     if args.json:
         emit_json(True)
     else:
@@ -1370,6 +1537,9 @@ def cmd_daemon_install():
     print("✅ Autostart installed (%s) — daemon running on port %d "
           "(device '%s')." % (what, daemon_port(), info.get("name", "?")))
     print("   cross-copy will now start automatically when you log in.")
+    # A mismatch right after install means whatever answered the ping is
+    # NOT the daemon the service just started (likely an orphan on the port).
+    warn_version_mismatch(info.get("version"), orphan_hint=True)
 
 
 def cmd_daemon_uninstall():
@@ -1433,8 +1603,10 @@ def cmd_daemon(args):
             pass
         os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
     elif action == "start":
-        if ping():
+        info = ping()
+        if info:
             print("✅ Daemon already running on port %d." % daemon_port())
+            warn_version_mismatch(info.get("version"), orphan_hint=True)
             return
         print("Starting cross-copy daemon...")
         spawn_daemon()
@@ -1444,26 +1616,47 @@ def cmd_daemon(args):
                 % (START_WAIT_SECS, os.path.join(crosscopy_home(), "daemon.log")))
         print("✅ Daemon running on port %d (device '%s')."
               % (daemon_port(), info.get("name", "?")))
+        warn_version_mismatch(info.get("version"), orphan_hint=True)
     elif action == "stop":
         info = read_daemon_json()
-        if not info or not info.get("pid"):
-            if ping():
-                die("Daemon appears to be running but %s is missing; "
-                    "stop it manually." % os.path.join(crosscopy_home(), "daemon.json"))
-            print("Daemon is not running.")
+        pid = (info or {}).get("pid")
+        try:
+            pid = int(pid) if pid else None
+        except (TypeError, ValueError):
+            pid = None
+        if pid and pid_alive(pid):
+            error = terminate_pid(pid)
+            if error:
+                die(error)
+            print("✅ Daemon stopped (pid %d)." % pid)
             return
-        pid = int(info["pid"])
-        if not pid_alive(pid):
+        # No usable pidfile — but the port may still be held by an
+        # orphaned daemon (old install, lost/stale daemon.json). Ask it
+        # for its pid via /api/status and stop it.
+        answering, orphan_pid = probe_orphan_daemon()
+        if answering:
+            if orphan_pid and pid_alive(orphan_pid):
+                error = terminate_pid(orphan_pid)
+                if error:
+                    die(error)
+                print("✅ Orphaned daemon stopped (pid %d, found via "
+                      "/api/status)." % orphan_pid)
+            else:
+                die("A daemon is answering on port %d, but it reports no "
+                    "pid (an older version) and %s does not point at it.\n"
+                    "Find and stop it manually: %s"
+                    % (daemon_port(),
+                       os.path.join(crosscopy_home(), "daemon.json"),
+                       lsof_hint()))
+        elif pid:
             print("Daemon is not running (stale daemon.json removed).")
+        else:
+            print("Daemon is not running.")
+        if info is not None:  # clear the stale pidfile either way
             try:
                 os.remove(os.path.join(crosscopy_home(), "daemon.json"))
             except OSError:
                 pass
-            return
-        error = terminate_pid(pid)
-        if error:
-            die(error)
-        print("✅ Daemon stopped (pid %d)." % pid)
     elif action == "install":
         cmd_daemon_install()
     elif action == "uninstall":

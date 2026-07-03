@@ -138,10 +138,11 @@ def ensure_daemon():
 
 def spawn_popup(*args):
     """Launch a crosscopy.popup subprocess (fire and forget).
-    Each popup is its own process so tkinter never fights pystray for the
-    main thread. Popup stderr goes to widget.log so failures (no display,
-    missing tkinter, tracebacks) are diagnosable. Returns the Popen, or
-    None."""
+    Each popup is its own process so its GUI toolkit (AppKit on macOS,
+    tkinter elsewhere — popup.py picks its own backend) never fights
+    pystray for the main thread. Popup stderr goes to widget.log so
+    failures (no display, missing tkinter, PyObjC errors, tracebacks) are
+    diagnosable. Returns the Popen, or None."""
     argv = [sys.executable, "-m", "crosscopy.popup"] + [str(a) for a in args]
     stderr = subprocess.DEVNULL
     try:

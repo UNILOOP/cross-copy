@@ -184,16 +184,37 @@ declined/completed (sender side), incoming files saved.
 
 The tray widget is the primary notification surface — OS notification centers gave no
 action buttons and looked bad on Linux:
-- `crosscopy/popup.py`: standalone tkinter popup processes (`python -m crosscopy.popup
-  offer <id>` / `info "<title>" "<body>"`), frameless, always-on-top, top-right stacked
-  (`--slot N`), glass-styled. Offer popups show Accept/Decline buttons wired to the local
-  offers API and auto-close when the offer resolves elsewhere or expires; info popups
-  auto-dismiss ~6 s. Run as subprocesses so tkinter never contends with pystray's main
-  thread (critical on macOS).
+- `crosscopy/popup.py`: standalone popup processes (`python -m crosscopy.popup
+  offer <id>` / `info "<title>" "<body>"` / `share <peer> <clip_id>`), frameless,
+  always-on-top, top-right stacked (`--slot N`), glass-styled. Offer popups show
+  Accept/Decline buttons wired to the local offers API and auto-close when the offer
+  resolves elsewhere or expires; share popups show Dismiss + Save here/Get text
+  (auto-dismiss 60 s); info popups auto-dismiss ~6 s. Run as subprocesses so the GUI
+  toolkit never contends with pystray's main thread.
+- Backend per platform: **darwin** renders each card as a native AppKit window
+  (borderless non-activating `NSPanel`, `NSStatusWindowLevel`, accessory activation
+  policy — no Dock icon, rounded dark layer-backed card, native `NSButton`s,
+  target/selector `NSTimer`s for auto-dismiss/offer-poll, HTTP on worker threads with UI
+  dispatched back via `NSOperationQueue.mainQueue`), because tkinter
+  `overrideredirect` windows are unreliable on aqua Tk (cards never appear / can't take
+  clicks). PyObjC is guaranteed present there (pystray depends on it). **Linux/other**
+  keeps the tkinter cards. `--dry-run` prints computed geometry/content JSON on both.
+- Last-resort fallback: if no windowing backend can show a card (AppKit **and** tkinter
+  fail on mac; tkinter fails on Linux), the popup process fires a plain OS notification
+  via `crosscopy.notify`'s platform helpers directly (osascript / notify-send),
+  bypassing notify()'s widget-connected suppression — the popup IS the widget's
+  notification path, so the user is never left with silence.
 - The widget subscribes to `/api/events?client=widget`. While any `client=widget`
   subscriber is connected, `notify()` suppresses OS notifications entirely (the widget pops
   its own cards on `offers` events by diffing `/api/offers`). No widget running → OS
   notifications remain as fallback.
+- `ccp update` restarts a running tray widget after a successful self-update (SIGTERM
+  via `widget.json` pid, then respawn — unless launchd/autostart already brought it
+  back), so the widget and its popup cards never keep running stale code. It also
+  verifies the restarted daemon reports the just-installed version and warns loudly when
+  it doesn't (daemon running from a different Python environment); `ccp status` /
+  `ccp daemon start` print a one-line version-mismatch warning too. All best-effort,
+  never fatal.
 
 ## Tray widget (v0.4)
 

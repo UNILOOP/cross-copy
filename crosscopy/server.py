@@ -419,6 +419,9 @@ def create_app(discovery=None, updater=None) -> Flask:
     def api_status():
         info = _device_info()
         info["port"] = config.get_port()
+        # The serving process's real pid — daemon.json can go stale (orphaned
+        # daemons survive it); this is ground truth for stop/restart tooling.
+        info["pid"] = os.getpid()
         info["clipboard"] = clipboard.load_clipboard()
         info["update"] = _update_state()
         return jsonify(info)
