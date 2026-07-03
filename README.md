@@ -5,7 +5,9 @@
 `ccp copy` a file — or a snippet of text — on one machine, `ccp paste` on
 another — that's it. cross-copy discovers your machines automatically over mDNS
 and transfers everything directly between them over your LAN. No cloud, no
-account, no config: your data never leaves your network.
+account, no config: your data never leaves your network. Want to hand a file
+to one machine in particular? `ccp send` offers it AirDrop-style — nothing
+transfers until the other side accepts.
 
 ## 20-second demo
 
@@ -39,6 +41,47 @@ ccp paste > out.txt         # paste it into a file on the other machine
 ```
 
 Works with multiple files and whole directories too: `ccp copy photos/ report.docx`.
+
+## Send to a specific device (AirDrop-style) 📨
+
+The clipboard is a *pull* model — whoever pastes first gets it. `ccp send` is
+a *push*: you pick the target machine, and nothing transfers until someone
+there says yes.
+
+```console
+# On your Mac
+$ ccp send report.pdf --to linux-box
+📨 Offered 1 file (2.4 MB) to linux-box — waiting for them to accept...
+✅ linux-box accepted — 1 file delivered
+```
+
+```console
+# Meanwhile on linux-box, a desktop notification pops up:
+#   📥 sayeed-macbook wants to send 1 file (2.4 MB)
+$ ccp offers
+ID        FROM            CONTENTS        AGE
+3f9c1a2b  sayeed-macbook  1 file, 2.4 MB  4s
+
+Accept with: ccp accept [id] [dir]   ·   Decline with: ccp decline [id]
+
+$ ccp accept
+📥 Accepted 1 file (2.4 MB) from sayeed-macbook
+   /home/you/Downloads/cross-copy/report.pdf
+```
+
+Good to know:
+
+- `--to` takes a device name or id, and is **optional when there's exactly
+  one other device** on the network.
+- Text works too — `ccp send "the wifi password" --to macbook` — with the
+  same path-vs-text rules as `ccp copy` (`-t`/`--text` forces text, and piped
+  stdin works: `ccp send --to macbook < notes.txt`). Accepted text prints to
+  stdout, so it pipes.
+- Offers **expire after 5 minutes** if nobody answers (Ctrl-C while waiting
+  doesn't cancel the offer — it stays acceptable until it expires). The
+  sender is told whether you accepted or declined.
+- Accepted files land in `~/Downloads/cross-copy` by default — change that
+  with the `receive_dir` config key, or per-accept: `ccp accept [id] ~/dir`.
 
 ## Install
 
@@ -75,6 +118,10 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 | `ccp copy <path...\|text>` | Put files/dirs on the network clipboard (stays valid for repeated pastes). If no argument is an existing path, the arguments are copied as **text**; `--text`/`-t` forces text. `echo foo \| ccp copy` copies stdin |
 | `ccp move <path...>` | Like copy, but source files are deleted after a successful paste (a text move clears the source clipboard) |
 | `ccp paste [dir]` | Paste the newest peer clipboard into `dir` (default: current dir); a **text** clipboard is printed verbatim to stdout instead (pipeable: `ccp paste > out.txt`). `--from <name\|id>` to pick a machine |
+| `ccp send <path...\|text> --to <name\|id>` | Offer files or text to **one specific device** and wait for them to accept (AirDrop-style). Same path-vs-text rules as `ccp copy`; `--to` is optional when there's exactly one other device |
+| `ccp offers` | List pending incoming offers (id, sender, contents, age) |
+| `ccp accept [id] [dir]` | Accept an offer — newest one if no id (a short id prefix is enough). Text prints to stdout; files go to `dir`, or your `receive_dir` if omitted |
+| `ccp decline [id]` | Decline an offer (newest if no id) — the sender is notified |
 | `ccp devices` | List machines on the LAN with their clipboard contents (alias: `ccp list`) |
 | `ccp status` | Show daemon status and your current local clipboard |
 | `ccp clear` | Clear your local clipboard |
@@ -84,7 +131,34 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 | `ccp daemon install` | Set up start-at-login (systemd user unit / launchd agent) and start the daemon now. `install.sh` runs this by default (`--no-service` to opt out) |
 | `ccp daemon uninstall` | Stop, disable, and remove the start-at-login service |
 | `ccp ui` | Open the web UI in your browser |
+| `ccp widget` | Run the menu-bar / system-tray companion (needs the optional `[widget]` extra — see below) |
+| `ccp update` | Update cross-copy to the latest version (and restart the daemon) |
+| `ccp update --check` | Only check whether a newer version is available |
 | `ccp version` | Print the version |
+
+## Updates
+
+cross-copy keeps itself up to date **by default**: the daemon checks for a new
+version shortly after it starts and every 6 hours, installs it, and restarts
+itself. You don't have to do anything.
+
+- **Turn auto-update off** by setting `"auto_update": false` in
+  `~/.crosscopy/config.json`. You'll still see an update notice in `ccp status`
+  and the web UI when a new version is out.
+- **Update manually** any time with `ccp update` (or just see what's out there
+  with `ccp update --check`).
+
+## Configuration
+
+Everything lives in `~/.crosscopy/config.json` (created on first run; edit
+and restart the daemon to apply):
+
+| Key | Default | What it does |
+|---|---|---|
+| `device_name` | your hostname | How this machine appears to others — or just run `ccp name <newname>` |
+| `receive_dir` | `~/Downloads/cross-copy` | Where files from **accepted offers** (`ccp send` → `ccp accept`) are saved; `~` is expanded. Override per-accept with `ccp accept [id] <dir>` |
+| `notifications` | `true` | Desktop notifications (macOS Notification Center, `notify-send`/D-Bus on Linux) for incoming offers, declines, and finished transfers. Set to `false` to silence them |
+| `auto_update` | `true` | Let the daemon update itself automatically (see [Updates](#updates)) |
 
 ## Web UI 🖱️
 
@@ -92,11 +166,38 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 ccp ui
 ```
 
-Opens `http://localhost:7373` — see every device on your network and what's on
-its clipboard, and **drag & drop** files into the browser to put them on the
-clipboard without touching the terminal. There's a **text box** too: type or
-paste text on one machine, then hit "Paste text here" on the other — the text
-lands right there and is put on the browser clipboard as well.
+Opens `http://localhost:7373` — see every device on your network and what each
+one is sharing, live: the page updates the moment something changes, no
+refreshing needed. **Drag & drop** files into the browser to share them from
+this device without touching the terminal, or use **"Share text"** to share a
+snippet. On the other machine, hit **"Save to this device"** to receive files
+(pick the folder with "Save into folder") or **"Get text"** to grab shared text
+— it lands right there and goes onto the browser clipboard as well. Done
+sharing? Hit **"Stop sharing"**.
+
+### Tray widget
+
+```sh
+ccp widget
+```
+
+Puts cross-copy in your **menu bar (macOS) / system tray (Linux)**: send
+files or your clipboard text to any device in a couple of clicks, and accept
+or decline incoming offers without opening a terminal. **"Open panel"** pops
+a compact panel with the same controls, live-updating.
+
+The widget needs two optional dependencies (`pystray` and `Pillow`), packaged
+as the `widget` extra:
+
+```sh
+pip install "cross-copy[widget]"
+# pipx users:
+pipx install "cross-copy[widget]" --force
+```
+
+Desktop notifications don't need the extra: on macOS and Linux the daemon
+fires them natively whenever an offer arrives, is declined, or a transfer
+finishes.
 
 ## How it works
 
@@ -109,12 +210,21 @@ lands right there and is put on the browser clipboard as well.
   your LAN.
 - `ccp move` is safe: the source files are only deleted after the receiving
   machine confirms a fully successful paste.
+- `ccp send` works the other way around: the sender posts an *offer* (just
+  metadata) to the target, and accepting it pulls the files straight from the
+  sender — nothing is transferred until then, and unanswered offers expire
+  after 5 minutes.
 
 ## Troubleshooting
 
 - **A device doesn't show up in `ccp devices`** — some networks (corporate
   Wi-Fi, VLANs, some routers) block mDNS. Add the peer manually by IP:
   `ccp add 192.168.1.5`.
+- **One-way visibility** (machine A sees B, but B doesn't see A) — as of v0.3
+  this self-heals: machines that can reach each other introduce themselves
+  directly, so as long as *either* machine can reach the other, both show up
+  within about a minute. If neither direction works, fall back to
+  `ccp add <ip>` on one side.
 - **Devices see each other but transfers fail** — a firewall is likely blocking
   the daemon port. Open **TCP 7373** (or your `CROSSCOPY_PORT`) on both
   machines.
@@ -131,9 +241,9 @@ lands right there and is put on the browser clipboard as well.
 
 ## ⚠️ Security
 
-**v0.2.0 trusts your LAN.** There is no authentication or encryption yet: any
+**v0.4.0 trusts your LAN.** There is no authentication or encryption yet: any
 device on your network can read your cross-copy clipboard (files *and* text)
-and send you files.
+and offer you files.
 Use it on networks you trust (home, small office) — **not** on public or
 untrusted Wi-Fi. Pairing codes and TLS are on the roadmap.
 

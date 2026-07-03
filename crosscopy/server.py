@@ -1,33 +1,46 @@
 """Flask HTTP server for cross-copy.
 
 One Flask app serves three surfaces on the same port:
-  - the peer-facing transfer API   (/api/ping, /api/clipboard/*)
-  - the local control API          (/api/status, /api/peers, /api/copy, ...)
-  - the web UI                     (static files from crosscopy/webui/)
+  - the peer-facing transfer API   (/api/ping, /api/hello, /api/clipboard/*,
+                                    /api/offer*)
+  - the local control API          (/api/status, /api/peers, /api/copy,
+                                    /api/send, /api/offers,
+                                    /api/events (SSE), ...)
+  - the web UI + widget panel      (static files from crosscopy/webui/ at /,
+                                    crosscopy/widgetui/ at /widget)
 
 Trusted-LAN model (v0.1.0): no auth, binds 0.0.0.0.
 """
 
+import json
 import logging
 import os
+import queue
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import (Flask, Response, jsonify, request, send_file,
+                   send_from_directory)
 
-from . import __version__, clipboard, config
+from . import __version__, clipboard, config, offers
+from .events import bus
+from .offers import safe_rel_parts as _safe_rel_parts
+from .offers import unique_path as _unique_path
 
 log = logging.getLogger("crosscopy.server")
 
 WEBUI_DIR = Path(__file__).resolve().parent / "webui"
+WIDGETUI_DIR = Path(__file__).resolve().parent / "widgetui"
 
 PING_TIMEOUT = 2.0        # seconds, for live peer meta/ping fetches
 CONSUMED_TIMEOUT = 5.0
+OFFER_TIMEOUT = 5.0       # cross-peer offer push
 TRANSFER_TIMEOUT = (5.0, 300.0)  # (connect, read) for file downloads
 CHUNK_SIZE = 64 * 1024
+SSE_HEARTBEAT = 15.0      # seconds between ": ping" comments on /api/events
 
 
 # ---------------------------------------------------------------------------
@@ -74,32 +87,6 @@ def _attach_clipboards(peers: list) -> None:
         peer["clipboard"] = manifest
 
 
-def _safe_rel_parts(rel_path: str):
-    """Validate a peer-supplied rel_path; returns path parts or None if unsafe."""
-    parts = PurePosixPath(rel_path).parts
-    if not parts:
-        return None
-    for part in parts:
-        if part in ("..", ".", "") or part.startswith("/") or "\\" in part or ":" in part:
-            return None
-    if PurePosixPath(rel_path).is_absolute():
-        return None
-    return parts
-
-
-def _unique_path(path: Path) -> Path:
-    """Collision-rename: 'name.ext' -> 'name (1).ext', 'name (2).ext', ..."""
-    if not path.exists():
-        return path
-    stem, suffix = path.stem, path.suffix
-    n = 1
-    while True:
-        candidate = path.with_name("%s (%d)%s" % (stem, n, suffix))
-        if not candidate.exists():
-            return candidate
-        n += 1
-
-
 def _error(message: str, status: int):
     return jsonify({"error": message}), status
 
@@ -117,10 +104,12 @@ def _notify_consumed(peer: dict, clipboard_id: str) -> None:
 # ---------------------------------------------------------------------------
 # App factory
 
-def create_app(discovery=None) -> Flask:
+def create_app(discovery=None, updater=None) -> Flask:
     """Build the Flask app. `discovery` is a crosscopy.discovery.Discovery
     (or anything with a get_peers() -> list method); may be None for tests,
-    in which case the peer list is empty."""
+    in which case the peer list is empty. `updater` is a
+    crosscopy.updater.Updater (or anything with a state() -> dict method);
+    may be None, in which case /api/status reports a never-checked state."""
     app = Flask("crosscopy", static_folder=None)
 
     def _get_peers():
@@ -128,11 +117,62 @@ def create_app(discovery=None) -> Flask:
             return []
         return [dict(p) for p in discovery.get_peers()]
 
+    def _clipboard_changed():
+        """Local clipboard changed (copy/upload/clear/consumed): tell local
+        SSE clients and kick off a hello round so remote UIs react too."""
+        bus.publish("clipboard")
+        if discovery is not None:
+            try:
+                discovery.hello_now()
+            except Exception:
+                pass
+
+    def _update_state() -> dict:
+        if updater is not None:
+            return updater.state()
+        return {
+            "current": __version__,
+            "latest": None,
+            "available": False,
+            "last_checked": None,
+            "auto_update": config.get_auto_update(),
+        }
+
     # -- peer-facing API ----------------------------------------------------
 
     @app.get("/api/ping")
     def api_ping():
         return jsonify(_device_info())
+
+    @app.post("/api/hello")
+    def api_hello():
+        """Reciprocal discovery: a peer introduces itself; we record it
+        (host = the request's source address) and answer with our own info."""
+        body = request.get_json(silent=True) or {}
+        peer_id = str(body.get("id") or "").strip()
+        if not peer_id:
+            return _error("missing 'id'", 400)
+        try:
+            port = int(body.get("port") or config.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            return _error("invalid 'port'", 400)
+        if discovery is not None:
+            discovery.record_peer(
+                peer_id,
+                name=body.get("name") or peer_id,
+                host=request.remote_addr,
+                port=port,
+                platform=body.get("platform", "unknown"),
+                version=body.get("version", "unknown"),
+                source="hello",
+            )
+        # Always publish: peers hello us when *their* state changes (e.g.
+        # their clipboard), so local clients should refetch even when the
+        # peer record itself is unchanged.
+        bus.publish("peers")
+        info = _device_info()
+        info["port"] = config.get_port()
+        return jsonify(info)
 
     @app.get("/api/clipboard/meta")
     def api_clipboard_meta():
@@ -166,8 +206,110 @@ def create_app(discovery=None) -> Flask:
             clipboard.delete_sources(manifest)
             clipboard.clear_clipboard()
             log.info("clipboard %s consumed by peer; sources deleted", clipboard_id)
+            _clipboard_changed()
             return jsonify({"deleted": True})
         return jsonify({"deleted": False})
+
+    # -- peer-facing offers API (v0.4) ---------------------------------------
+
+    @app.post("/api/offer")
+    def api_offer():
+        """A peer pushes a targeted offer at us; we store it as pending,
+        fire the SSE event + desktop notification, and wait for the local
+        user to accept/decline."""
+        body = request.get_json(silent=True) or {}
+        offer_id = str(body.get("offer_id") or "").strip()
+        sender = body.get("from")
+        kind = body.get("kind")
+        if not offer_id or not isinstance(sender, dict) or not sender.get("id"):
+            return _error("invalid offer", 400)
+        try:
+            sender_port = int(body.get("sender_port") or config.DEFAULT_PORT)
+        except (TypeError, ValueError):
+            return _error("invalid 'sender_port'", 400)
+        try:
+            created_at = float(body.get("created_at") or time.time())
+        except (TypeError, ValueError):
+            created_at = time.time()
+
+        record = {
+            "offer_id": offer_id,
+            "from": {
+                "id": sender.get("id"),
+                "name": sender.get("name") or sender.get("id"),
+                "platform": sender.get("platform", "unknown"),
+            },
+            "sender_port": sender_port,
+            "kind": kind,
+            "created_at": created_at,
+        }
+        if kind == "text":
+            text = body.get("text")
+            if not isinstance(text, str) or not text:
+                return _error("text offer without text", 400)
+            if len(text.encode("utf-8")) > clipboard.MAX_TEXT_BYTES:
+                return _error("text too large", 400)
+            record["text"] = text
+            record["total_size"] = len(text.encode("utf-8"))
+        elif kind == "files":
+            files = body.get("files")
+            if not isinstance(files, list) or not files:
+                return _error("files offer without files", 400)
+            entries = []
+            for i, f in enumerate(files):
+                if not isinstance(f, dict) or not f.get("rel_path"):
+                    return _error("invalid file entry", 400)
+                try:
+                    entries.append({
+                        "index": int(f.get("index", i)),
+                        "rel_path": str(f["rel_path"]),
+                        "size": int(f.get("size", 0)),
+                    })
+                except (TypeError, ValueError):
+                    return _error("invalid file entry", 400)
+            record["files"] = entries
+            try:
+                record["total_size"] = int(
+                    body.get("total_size")
+                    or sum(e["size"] for e in entries))
+            except (TypeError, ValueError):
+                record["total_size"] = sum(e["size"] for e in entries)
+        else:
+            return _error("invalid 'kind'", 400)
+
+        offers.manager.record_incoming(record, request.remote_addr)
+        log.info("incoming offer %s from %s: %s", offer_id,
+                 record["from"]["name"], offers.summarize(record))
+        return jsonify({"status": "pending"})
+
+    @app.get("/api/offer/<offer_id>/file/<int:index>")
+    def api_offer_file(offer_id, index):
+        """Sender side: stream one offered file to the receiver while the
+        offer is still pending/accepted; 410 otherwise."""
+        offer = offers.manager.get_outgoing(offer_id)
+        if (offer is None or offer.get("kind") != "files"
+                or offer.get("status") not in offers.ACTIVE_STATES):
+            return _error("offer no longer available", 410)
+        files = offer.get("files", [])
+        if index < 0 or index >= len(files):
+            return _error("bad file index", 404)
+        source = files[index].get("source_path")
+        if not source or not os.path.isfile(source):
+            return _error("source file missing", 404)
+        return send_file(source, mimetype="application/octet-stream",
+                         conditional=False)
+
+    @app.post("/api/offer/<offer_id>/result")
+    def api_offer_result(offer_id):
+        """Sender side: the receiver reports an outcome for our offer."""
+        body = request.get_json(silent=True) or {}
+        result = body.get("result")
+        if result not in offers.RESULT_STATES:
+            return _error("invalid 'result'", 400)
+        offer = offers.manager.set_outgoing_status(offer_id, result)
+        if offer is None:
+            return _error("unknown offer", 404)
+        return jsonify({"status": offer.get("status")})
 
     # -- local control API --------------------------------------------------
 
@@ -176,7 +318,37 @@ def create_app(discovery=None) -> Flask:
         info = _device_info()
         info["port"] = config.get_port()
         info["clipboard"] = clipboard.load_clipboard()
+        info["update"] = _update_state()
         return jsonify(info)
+
+    @app.get("/api/events")
+    def api_events():
+        """Server-sent events: payload-free {"type": ...} JSON lines with a
+        ": ping" heartbeat comment every 15 s. Clients refetch /api/status or
+        /api/peers on receipt.
+
+        `?client=widget` tags the subscription: while a widget client is
+        connected, the daemon suppresses OS notifications (the widget shows
+        its own popup cards with accept/decline actions instead)."""
+        tag = request.args.get("client") or None
+
+        def stream():
+            q = bus.subscribe(tag=tag)
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        event = q.get(timeout=SSE_HEARTBEAT)
+                        yield "data: %s\n\n" % json.dumps(event)
+                    except queue.Empty:
+                        yield ": ping\n\n"
+            finally:  # client disconnected (or server shutdown)
+                bus.unsubscribe(q)
+
+        return Response(stream(), mimetype="text/event-stream", headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # defeat proxy buffering
+        })
 
     @app.post("/api/name")
     def api_name():
@@ -185,6 +357,12 @@ def create_app(discovery=None) -> Flask:
         if not name:
             return _error("missing 'name'", 400)
         config.set_device_name(name)
+        bus.publish("peers")
+        if discovery is not None:
+            try:
+                discovery.hello_now()  # propagate the new name to peers
+            except Exception:
+                pass
         return jsonify(_device_info())
 
     @app.get("/api/peers")
@@ -245,6 +423,7 @@ def create_app(discovery=None) -> Flask:
                 return _error(str(exc), 400)
         clipboard.set_clipboard(manifest)
         log.info("clipboard set: %s (%s)", clipboard.summarize(manifest), op)
+        _clipboard_changed()
         return jsonify(manifest)
 
     @app.post("/api/paste")
@@ -353,6 +532,7 @@ def create_app(discovery=None) -> Flask:
     @app.post("/api/clipboard/clear")
     def api_clipboard_clear():
         clipboard.clear_clipboard()
+        _clipboard_changed()
         return jsonify({"cleared": True})
 
     @app.post("/api/upload")
@@ -395,7 +575,136 @@ def create_app(discovery=None) -> Flask:
         }
         clipboard.set_clipboard(manifest)  # also clears older staging dirs
         log.info("clipboard set from upload: %s", clipboard.summarize(manifest))
+        _clipboard_changed()
         return jsonify(manifest)
+
+    # -- local offers API (v0.4) ----------------------------------------------
+
+    @app.post("/api/send")
+    def api_send():
+        """Build an outgoing offer and push it at the chosen peer."""
+        body = request.get_json(silent=True) or {}
+        peer_id = str(body.get("peer_id") or "").strip()
+        paths = body.get("paths")
+        text = body.get("text")
+        if not peer_id:
+            return _error("missing 'peer_id'", 400)
+        if (paths is None) == (text is None):
+            return _error("give either 'paths' or 'text', not both", 400)
+        if paths is not None and (not isinstance(paths, list) or not paths):
+            return _error("'paths' must be a non-empty list", 400)
+
+        matches = [p for p in _get_peers()
+                   if p.get("id") == peer_id or p.get("name") == peer_id]
+        if not matches:
+            return _error("peer not found: %s" % peer_id, 404)
+        peer = matches[0]
+
+        try:
+            offer = offers.manager.create_outgoing(peer, paths=paths, text=text)
+        except ValueError as exc:
+            return _error(str(exc), 400)
+
+        try:
+            resp = requests.post(_peer_url(peer, "/api/offer"),
+                                 json=offers.wire_offer(offer),
+                                 timeout=OFFER_TIMEOUT)
+            resp.raise_for_status()
+        except Exception as exc:
+            offers.manager.discard_outgoing(offer["offer_id"])
+            return _error("peer unreachable: %s" % exc, 502)
+
+        log.info("offer %s sent to %s: %s", offer["offer_id"],
+                 peer.get("name"), offers.summarize(offer))
+        return jsonify(offers.public_offer(offer))
+
+    @app.get("/api/send/<offer_id>")
+    def api_send_status(offer_id):
+        offer = offers.manager.get_outgoing(offer_id)
+        if offer is None:
+            return _error("unknown offer", 404)
+        return jsonify(offers.public_offer(offer))
+
+    @app.get("/api/offers")
+    def api_offers():
+        return jsonify({"offers": [offers.public_offer(o)
+                                   for o in offers.manager.list_incoming_pending()]})
+
+    @app.post("/api/offers/<offer_id>/accept")
+    def api_offers_accept(offer_id):
+        body = request.get_json(silent=True) or {}
+        offer = offers.manager.get_incoming(offer_id)
+        if offer is None:
+            return _error("unknown offer", 404)
+        if offer.get("status") != "pending":
+            return _error("offer is %s" % offer.get("status"), 409)
+        sender = offer.get("from", {})
+
+        # Text offers: the content already arrived with the offer.
+        if offer.get("kind") == "text":
+            offers.manager.set_incoming_status(offer_id, "accepted")
+            offers.report_result(offer, "accepted")   # best effort
+            offers.report_result(offer, "completed")  # best effort
+            offers.manager.set_incoming_status(offer_id, "completed")
+            log.info("accepted text offer %s from %s", offer_id,
+                     sender.get("name"))
+            return jsonify({
+                "from": {"id": sender.get("id"), "name": sender.get("name")},
+                "kind": "text",
+                "text": offer.get("text", ""),
+            })
+
+        # Files: pull them from the sender (the client waits on this).
+        dest_raw = body.get("dest")
+        if dest_raw:
+            dest = Path(str(dest_raw)).expanduser()
+            if not dest.is_absolute():
+                return _error("'dest' must be an absolute path", 400)
+        else:
+            dest = config.get_receive_dir()
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return _error("cannot create dest dir: %s" % exc, 400)
+
+        if not offers.report_result(offer, "accepted"):
+            offers.manager.set_incoming_status(offer_id, "failed")
+            return _error("sender unreachable or offer no longer available", 502)
+        offers.manager.set_incoming_status(offer_id, "accepted")
+
+        try:
+            written, total_bytes = offers.pull_files(offer, dest)
+        except RuntimeError as exc:
+            offers.report_result(offer, "failed")  # best effort
+            offers.manager.set_incoming_status(offer_id, "failed")
+            log.warning("offer %s from %s failed: %s", offer_id,
+                        sender.get("name"), exc)
+            return _error("transfer failed: %s" % exc, 502)
+
+        offers.report_result(offer, "completed")  # best effort
+        offers.manager.set_incoming_status(offer_id, "completed")
+        offers.notify_files_saved(offer, dest, len(written), total_bytes)
+        log.info("accepted offer %s: %d files (%s) from %s into %s",
+                 offer_id, len(written), config.format_size(total_bytes),
+                 sender.get("name"), dest)
+        return jsonify({
+            "from": {"id": sender.get("id"), "name": sender.get("name")},
+            "kind": "files",
+            "files_written": [str(p) for p in written],
+            "total_bytes": total_bytes,
+            "dest": str(dest),
+        })
+
+    @app.post("/api/offers/<offer_id>/decline")
+    def api_offers_decline(offer_id):
+        offer = offers.manager.get_incoming(offer_id)
+        if offer is None:
+            return _error("unknown offer", 404)
+        offers.report_result(offer, "declined")  # best effort
+        offers.manager.set_incoming_status(offer_id, "declined", remove=True)
+        log.info("declined offer %s from %s", offer_id,
+                 offer.get("from", {}).get("name"))
+        return jsonify({"declined": True})
 
     # -- web UI -------------------------------------------------------------
 
@@ -407,6 +716,20 @@ def create_app(discovery=None) -> Flask:
         return ("<html><body><h1>cross-copy</h1>"
                 "<p>Web UI files not installed.</p></body></html>", 200,
                 {"Content-Type": "text/html"})
+
+    @app.get("/widget")
+    def widget_index():
+        """Compact tray-widget panel (static files from crosscopy/widgetui/)."""
+        page = WIDGETUI_DIR / "widget.html"
+        if page.is_file():
+            return send_from_directory(str(WIDGETUI_DIR), "widget.html")
+        return ("<html><body><h1>cross-copy widget</h1>"
+                "<p>Widget UI files not installed.</p></body></html>", 200,
+                {"Content-Type": "text/html"})
+
+    @app.get("/widget/<path:filename>")
+    def widget_static(filename):
+        return send_from_directory(str(WIDGETUI_DIR), filename)
 
     @app.get("/<path:filename>")
     def webui_static(filename):

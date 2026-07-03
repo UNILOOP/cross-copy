@@ -28,7 +28,14 @@ for arg in "$@"; do
         --no-service) INSTALL_SERVICE=0 ;;
         --service) ;; # back-compat no-op: autostart is now the default
         -h|--help)
-            sed -n '2,19p' "$0" 2>/dev/null || true
+            # In `curl | bash` mode $0 is not this script; fall back to a
+            # short usage message instead of printing nothing.
+            if [ -f "$0" ] && sed -n '2,19p' "$0" 2>/dev/null; then
+                :
+            else
+                echo "Usage: install.sh [--no-service]"
+                echo "  --no-service   skip daemon autostart setup (ccp daemon install)"
+            fi
             exit 0
             ;;
         *)
@@ -83,12 +90,30 @@ info "Using Python: $PYTHON ($("$PYTHON" -c 'import sys; print(".".join(map(str,
 SRC=""
 TMP_CLONE=""
 
+# Register the cleanup trap BEFORE any mktemp/clone below: if the clone (or
+# anything after mktemp) dies, the temp dir must still be removed.
+cleanup() {
+    if [ -n "$TMP_CLONE" ] && [ -d "$TMP_CLONE" ]; then
+        rm -rf "$TMP_CLONE"
+    fi
+}
+trap cleanup EXIT
+
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
     SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
     if [ -f "$SCRIPT_DIR/pyproject.toml" ]; then
-        SRC="$SCRIPT_DIR"
-        info "Installing from local checkout: $SRC"
+        info "Installing from local checkout: $SCRIPT_DIR"
+        # Install from a clean temp copy of the checkout, not the checkout
+        # itself: setuptools reuses a stale in-tree build/ dir (mtime-based),
+        # which can silently install OLD code, and in-tree builds litter the
+        # checkout with build/ and *.egg-info.
+        TMP_CLONE="$(mktemp -d "${TMPDIR:-/tmp}/cross-copy.XXXXXX")"
+        cp -R "$SCRIPT_DIR" "$TMP_CLONE/src"
+        rm -rf "$TMP_CLONE/src/build" "$TMP_CLONE/src/dist" \
+               "$TMP_CLONE/src/.git" "$TMP_CLONE/src/.venv" \
+               "$TMP_CLONE/src/venv" "$TMP_CLONE/src"/*.egg-info
+        SRC="$TMP_CLONE/src"
     fi
 fi
 
@@ -101,13 +126,6 @@ if [ -z "$SRC" ]; then
     SRC="$TMP_CLONE/cross-copy"
 fi
 
-cleanup() {
-    if [ -n "$TMP_CLONE" ] && [ -d "$TMP_CLONE" ]; then
-        rm -rf "$TMP_CLONE"
-    fi
-}
-trap cleanup EXIT
-
 # ---------------------------------------------------------------------------
 # 4. Install: prefer pipx, fall back to a dedicated venv
 # ---------------------------------------------------------------------------
@@ -118,10 +136,14 @@ CCP=""
 if command -v pipx >/dev/null 2>&1; then
     info "Installing with pipx ..."
     pipx install --force "$SRC"
-    if command -v ccp >/dev/null 2>&1; then
+    # Prefer the binary pipx just installed (~/.local/bin by default) over
+    # `command -v ccp`, which can resolve to a different, pre-existing
+    # install elsewhere on PATH.
+    if [ -x "$BIN_DIR/ccp" ]; then
+        CCP="$BIN_DIR/ccp"
+    elif command -v ccp >/dev/null 2>&1; then
         CCP="$(command -v ccp)"
     else
-        # pipx installs into ~/.local/bin by default
         CCP="$BIN_DIR/ccp"
     fi
 else
@@ -170,7 +192,11 @@ if [ "$INSTALL_SERVICE" -eq 1 ]; then
     if "$CCP" daemon install; then
         info "Daemon autostart enabled — it will start at login and is running now."
     else
-        warn "Could not set up autostart (e.g. no systemd on this system)."
+        if [ "$OS" = "Darwin" ]; then
+            warn "Could not set up autostart (launchctl could not load the launchd agent — see the error above for details)."
+        else
+            warn "Could not set up autostart (e.g. no systemd on this system)."
+        fi
         warn "This is not fatal: the daemon still auto-starts on first 'ccp' use."
         warn "You can retry later with:  ccp daemon install"
     fi

@@ -7,8 +7,16 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div id="reconnect-banner" class="reconnect-banner hidden">
+  <div class="ambient" aria-hidden="true"></div>
+
+  <div id="reconnect-banner" class="banner reconnect-banner hidden">
     <span class="spinner"></span> Lost connection to the daemon &mdash; reconnecting&hellip;
+  </div>
+
+  <div id="update-banner" class="banner update-banner hidden">
+    <span id="update-text"></span>
+    <button id="update-dismiss" class="update-dismiss" type="button"
+            aria-label="Dismiss update notice" title="Dismiss">&times;</button>
   </div>
 
   <header class="app-header">
@@ -27,30 +35,34 @@
 
   <main class="container">
 
-    <!-- This device's clipboard -->
-    <section class="card" id="local-card">
+    <!-- Incoming offers (targeted sends awaiting accept/decline) -->
+    <section id="offers-stack" class="offers-stack" aria-live="polite"
+             aria-label="Incoming offers"></section>
+
+    <!-- What this device is sharing -->
+    <section class="glass card" id="local-card">
       <div class="card-head">
-        <h2>This device's clipboard</h2>
+        <h2 id="local-card-title">Share from this device</h2>
         <div class="card-head-actions">
           <span id="local-op-badge" class="op-badge hidden"></span>
-          <button id="clear-btn" class="btn btn-ghost hidden" type="button">Clear</button>
+          <button id="clear-btn" class="btn btn-ghost hidden" type="button">Stop sharing</button>
         </div>
       </div>
 
       <div id="local-clipboard">
-        <p class="empty-state">Clipboard is empty. Use <code>ccp copy</code>, drop files, or type text below.</p>
+        <p class="empty-state">Nothing shared yet &mdash; drop files or type text below.</p>
       </div>
 
-      <div class="mode-tabs" role="tablist" aria-label="Clipboard input mode">
-        <button type="button" id="tab-files" class="mode-tab active" role="tab" aria-selected="true">Files</button>
-        <button type="button" id="tab-text" class="mode-tab" role="tab" aria-selected="false">Text</button>
+      <div class="mode-tabs" role="tablist" aria-label="Share mode">
+        <button type="button" id="tab-files" class="mode-tab active" role="tab" aria-selected="true">Share files</button>
+        <button type="button" id="tab-text" class="mode-tab" role="tab" aria-selected="false">Share text</button>
       </div>
 
       <div id="drop-zone" class="drop-zone" tabindex="0">
         <div class="drop-zone-inner">
           <span class="drop-icon">&#8682;</span>
-          <p>Drag &amp; drop files here, or</p>
-          <button id="pick-btn" class="btn btn-primary" type="button">Copy files from this browser</button>
+          <p>Drag &amp; drop files to share, or</p>
+          <button id="pick-btn" class="btn btn-primary" type="button">Choose files to share</button>
           <input type="file" id="file-input" multiple hidden>
         </div>
         <div id="upload-progress" class="upload-progress hidden">
@@ -63,7 +75,7 @@
         <textarea id="text-input" placeholder="Type or paste text to share&hellip;"
                   rows="4" spellcheck="false"></textarea>
         <div class="text-pane-actions">
-          <button id="copy-text-btn" class="btn btn-primary" type="button" disabled>Copy text</button>
+          <button id="copy-text-btn" class="btn btn-primary" type="button" disabled>Share text</button>
         </div>
       </div>
     </section>
@@ -73,8 +85,8 @@
       <div class="section-head">
         <h2>Devices on your network</h2>
         <label class="dest-field">
-          <span>Paste destination</span>
-          <input type="text" id="dest-input" placeholder="/absolute/destination/path"
+          <span>Save into folder</span>
+          <input type="text" id="dest-input" placeholder="/absolute/folder/path"
                  spellcheck="false" autocomplete="off">
         </label>
       </div>
@@ -84,7 +96,7 @@
     </section>
 
     <!-- Add device manually -->
-    <section class="card add-device-card">
+    <section class="glass card add-device-card">
       <div class="card-head">
         <h2>Add device manually</h2>
       </div>

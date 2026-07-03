@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import shutil
 import signal
 import subprocess
@@ -28,9 +29,16 @@ PING_TIMEOUT = 2.0
 START_WAIT_SECS = 5.0
 INSTALL_WAIT_SECS = 8.0  # service managers can be slower to start us
 MAX_TEXT_BYTES = 1024 * 1024  # 1 MB, matches the server-side limit
+OFFER_WAIT_SECS = 300.0  # offers expire after 5 minutes (SPEC v0.4)
+OFFER_POLL_SECS = 1.0
 
 SYSTEMD_UNIT_NAME = "cross-copy"
 LAUNCHD_LABEL = "com.crosscopy.daemon"
+
+UPDATE_URL_DEFAULT = ("https://raw.githubusercontent.com/UNILOOP/cross-copy/"
+                      "main/crosscopy/__init__.py")
+UPDATE_PKG_DEFAULT = ("https://github.com/UNILOOP/cross-copy/"
+                      "archive/refs/heads/main.tar.gz")
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +140,28 @@ def clipboard_summary(manifest):
     return summary
 
 
+def offer_contents(offer):
+    """Short offer description like '3 files (2.1 MB)' or 'text (12 chars)'."""
+    if offer.get("kind") == "text":
+        return "text (%s)" % plural(len(offer.get("text") or ""), "char")
+    files = offer.get("files") or []
+    return "%s (%s)" % (plural(len(files), "file"),
+                        human_size(offer.get("total_size", 0)))
+
+
+def human_age(epoch):
+    """Age like '42s' or '3m 05s' for an epoch timestamp."""
+    try:
+        delta = max(0, int(time.time() - float(epoch)))
+    except (TypeError, ValueError):
+        return "?"
+    if delta < 60:
+        return "%ds" % delta
+    if delta < 3600:
+        return "%dm %02ds" % (delta // 60, delta % 60)
+    return "%dh %02dm" % (delta // 3600, (delta % 3600) // 60)
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
@@ -194,6 +224,9 @@ def spawn_daemon():
             stdout=log,
             stderr=log,
             start_new_session=True,
+            # Neutral CWD: a crosscopy/ dir in the caller's CWD would land
+            # on sys.path and shadow the installed package.
+            cwd=os.path.expanduser("~"),
         )
     finally:
         log.close()
@@ -276,6 +309,19 @@ def run_cmd(cmd):
         return -1, str(e)
 
 
+def run_launchctl(args):
+    """Run launchctl with stdout AND stderr captured separately, so the real
+    error (usually on stderr) survives into our messages.
+    Returns (returncode, combined output); -1 if launchctl couldn't run."""
+    try:
+        proc = subprocess.run(["launchctl"] + list(args),
+                              capture_output=True, text=True)
+        parts = [s.strip() for s in (proc.stdout, proc.stderr) if s and s.strip()]
+        return proc.returncode, "\n".join(parts)
+    except OSError as e:
+        return -1, str(e)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -321,23 +367,27 @@ def do_copy_files(paths, op):
         print("   Files will be removed from this machine after they are pasted.")
 
 
-def cmd_copy(args, op):
+def classify_payload(args, cmd, usage_extra=""):
+    """Shared path-vs-text detection for copy/move/send.
+
+    All args exist as paths => ("files", [abs paths]); none exist => the args
+    joined with spaces are ("text", str); mixed => die and ask the user to
+    disambiguate. --text/-t forces text; no args + piped stdin reads stdin.
+    """
     items = args.paths
 
     if not items:
         if sys.stdin.isatty():
             die("ccp %s: missing paths or text.\n"
-                "Usage: ccp %s <path...>  |  ccp %s --text <words...>  |  "
-                "echo hi | ccp %s" % (op, op, op, op), code=2)
-        do_copy_text(read_stdin_text(), op)
-        return
+                "Usage: ccp %s <path...>%s  |  ccp %s --text <words...>%s  |  "
+                "echo hi | ccp %s%s"
+                % (cmd, cmd, usage_extra, cmd, usage_extra, cmd, usage_extra),
+                code=2)
+        return "text", read_stdin_text()
 
     if getattr(args, "text", False):
-        do_copy_text(" ".join(items), op)
-        return
+        return "text", " ".join(items)
 
-    # Path-vs-text detection: all args exist => files, none exist => text,
-    # mixed => refuse and ask the user to disambiguate.
     paths = []
     missing = []
     for p in items:
@@ -348,21 +398,37 @@ def cmd_copy(args, op):
             missing.append(p)
 
     if not missing:
-        do_copy_files(paths, op)
-    elif not paths:
-        do_copy_text(" ".join(items), op)
+        return "files", paths
+    if not paths:
+        return "text", " ".join(items)
+    die("Mixed arguments: some exist as paths, but these do not: %s\n"
+        "To send everything as text, use: ccp %s --text ...\n"
+        "Otherwise fix the path and try again." % (", ".join(missing), cmd))
+
+
+def cmd_copy(args, op):
+    kind, payload = classify_payload(args, op)
+    if kind == "text":
+        do_copy_text(payload, op)
     else:
-        die("Mixed arguments: some exist as paths, but these do not: %s\n"
-            "To send everything as text, use: ccp %s --text ...\n"
-            "Otherwise fix the path and try again." % (", ".join(missing), op))
+        do_copy_files(payload, op)
 
 
-def resolve_peer(name_or_id):
-    """Resolve a --from value to a peer id via /api/peers."""
+def list_peers():
+    """GET /api/peers and return the peer list (dies on error)."""
     r = api_get("/api/peers", timeout=10)
     if not r.ok:
         die("Could not list devices: %s" % api_error_message(r))
-    peers = r.json().get("peers", [])
+    return r.json().get("peers", [])
+
+
+def resolve_peer(name_or_id):
+    """Resolve a --from/--to value to a peer dict via /api/peers.
+
+    Exact id match first, then case-insensitive name match; dies with a
+    helpful message on no/ambiguous matches.
+    """
+    peers = list_peers()
     matches = [p for p in peers if p.get("id") == name_or_id]
     if not matches:
         matches = [p for p in peers
@@ -373,7 +439,28 @@ def resolve_peer(name_or_id):
     if len(matches) > 1:
         die("Multiple devices match '%s'; use the device id instead "
             "(see 'ccp devices')." % name_or_id)
-    return matches[0]["id"]
+    return matches[0]
+
+
+def resolve_send_target(to):
+    """Pick the target peer for `ccp send`.
+
+    --to given: resolve like paste's --from. --to omitted: OK only when
+    exactly one peer exists; otherwise list the choices and require --to.
+    """
+    if to:
+        return resolve_peer(to)
+    peers = list_peers()
+    if not peers:
+        die("No other cross-copy devices found on the network.\n"
+            "Make sure cross-copy is running on the target machine "
+            "(or add it manually: ccp add <ip>).")
+    if len(peers) == 1:
+        return peers[0]
+    names = ", ".join(sorted(p.get("name") or p.get("id") or "?"
+                             for p in peers))
+    die("There are %s on the network — pick one with --to <name>.\n"
+        "Devices: %s" % (plural(len(peers), "device"), names))
 
 
 def cmd_paste(args):
@@ -382,7 +469,7 @@ def cmd_paste(args):
 
     body = {"dest": dest}
     if getattr(args, "from_", None):
-        body["peer_id"] = resolve_peer(args.from_)
+        body["peer_id"] = resolve_peer(args.from_)["id"]
 
     r = api_post("/api/paste", body, timeout=600)
     if r.status_code == 404:
@@ -422,6 +509,279 @@ def cmd_paste(args):
     if result.get("op") == "move":
         print("   Source files were removed from %s."
               % (src.get("name") or "the source machine"))
+
+
+# ---------------------------------------------------------------------------
+# Targeted send / offers — see SPEC.md "Targeted send with accept/reject (v0.4)"
+# ---------------------------------------------------------------------------
+
+def offer_from_name(offer):
+    src = offer.get("from") or {}
+    return src.get("name") or src.get("id") or "unknown device"
+
+
+def wait_for_offer_result(offer, peer_name, live):
+    """Poll GET /api/send/<id> ~1/s until the offer reaches a terminal state.
+
+    Returns the last-seen offer object (still 'pending'/'accepted' if we hit
+    the 5-minute ceiling). With live=True a single status line is kept
+    up to date in place.
+    """
+    offer_id = offer.get("offer_id")
+    started = time.time()
+    deadline = started + OFFER_WAIT_SECS
+    current = offer
+    while True:
+        status = (current or {}).get("status", "pending")
+        if status in ("completed", "declined", "failed", "expired"):
+            break
+        if time.time() >= deadline:
+            break
+        if live:
+            if status == "accepted":
+                line = "   %s accepted — transferring..." % peer_name
+            else:
+                line = ("   waiting for %s to accept... (%ds)"
+                        % (peer_name, int(time.time() - started)))
+            sys.stdout.write("\r\033[K" + line)
+            sys.stdout.flush()
+        time.sleep(OFFER_POLL_SECS)
+        r = api_get("/api/send/%s" % offer_id, timeout=10)
+        if r.status_code == 404:
+            # Pruned on the daemon side — the offer expired.
+            current = dict(current or {}, status="expired")
+            break
+        if r.ok:
+            try:
+                current = r.json()
+            except ValueError:
+                pass
+    if live:
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+    return current or offer
+
+
+def cmd_send(args):
+    kind, payload = classify_payload(args, "send", " --to <device>")
+    ensure_daemon()
+    peer = resolve_send_target(args.to)
+    peer_name = peer.get("name") or peer.get("id") or "?"
+
+    body = {"peer_id": peer["id"]}
+    if kind == "text":
+        if not payload:
+            die("Nothing to send: the text is empty.")
+        body["text"] = payload
+    else:
+        body["paths"] = payload
+
+    r = api_post("/api/send", body, timeout=60)
+    if r.status_code == 404:
+        die("The daemon no longer knows device '%s' — check 'ccp devices' "
+            "and try again." % peer_name)
+    if r.status_code == 502:
+        die("Could not reach %s — is cross-copy running there?" % peer_name)
+    if not r.ok:
+        die("Send failed: %s" % api_error_message(r))
+    offer = r.json()
+
+    if not args.json:
+        print("📨 Offered %s to %s — waiting for them to accept..."
+              % (offer_contents(offer), peer_name))
+    live = (not args.json) and sys.stdout.isatty()
+
+    try:
+        final = wait_for_offer_result(offer, peer_name, live)
+    except KeyboardInterrupt:
+        if live:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+        err("\nStopped waiting. The offer stays valid for about 5 minutes — "
+            "%s can still accept it." % peer_name)
+        sys.exit(130)
+
+    status = (final or {}).get("status", "pending")
+    if args.json:
+        print(json.dumps(final, indent=2))
+
+    if status == "completed":
+        if not args.json:
+            if final.get("kind") == "text":
+                what = "text"
+            else:
+                what = plural(len(final.get("files") or []), "file")
+            print("✅ %s accepted — %s delivered" % (peer_name, what))
+        return
+    if status == "declined":
+        if not args.json:
+            err("🚫 %s declined" % peer_name)
+        sys.exit(1)
+    if status == "failed":
+        if not args.json:
+            reason = final.get("error") or final.get("reason")
+            err("❌ Transfer to %s failed%s"
+                % (peer_name, (": %s" % reason) if reason else "."))
+        sys.exit(1)
+    # "expired" from the daemon, or we timed out with the offer still pending.
+    if not args.json:
+        err("⌛ No answer from %s within 5 minutes — the offer expired."
+            % peer_name)
+    sys.exit(1)
+
+
+def fetch_offers():
+    """GET /api/offers and return the pending incoming offers (dies on error)."""
+    r = api_get("/api/offers")
+    if not r.ok:
+        die("Could not list offers: %s" % api_error_message(r))
+    return r.json().get("offers", [])
+
+
+def pick_offer(offers, offer_id):
+    """Pick an offer: newest when offer_id is None, else exact-id or
+    unambiguous short-id-prefix match. Returns None when nothing matches;
+    dies when a prefix is ambiguous."""
+    if not offer_id:
+        return max(offers, key=lambda o: o.get("created_at") or 0)
+    exact = [o for o in offers if o.get("offer_id") == offer_id]
+    if exact:
+        return exact[0]
+    prefixed = [o for o in offers
+                if (o.get("offer_id") or "").startswith(offer_id)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    if len(prefixed) > 1:
+        die("Offer id '%s' is ambiguous — use more characters "
+            "(see 'ccp offers')." % offer_id)
+    return None
+
+
+def cmd_offers(args):
+    ensure_daemon()
+    offers = fetch_offers()
+
+    if args.json:
+        print(json.dumps(offers, indent=2))
+        return
+
+    if not offers:
+        print("No pending offers.")
+        print("   (Someone can send you one with: ccp send <file> --to <you>)")
+        return
+
+    offers = sorted(offers, key=lambda o: o.get("created_at") or 0,
+                    reverse=True)
+    rows = []
+    for o in offers:
+        rows.append((
+            (o.get("offer_id") or "?")[:8],
+            offer_from_name(o),
+            clipboard_summary(o),
+            human_age(o.get("created_at")),
+        ))
+    headers = ("ID", "FROM", "CONTENTS", "AGE")
+    widths = [max(len(headers[i]), max(len(r[i]) for r in rows))
+              for i in range(len(headers))]
+    fmt = "  ".join("%%-%ds" % w for w in widths)
+    print(fmt % headers)
+    for row in rows:
+        print(fmt % row)
+    print("")
+    print("Accept with: ccp accept [id] [dir]   ·   Decline with: "
+          "ccp decline [id]")
+
+
+def cmd_accept(args):
+    ensure_daemon()
+    offers = fetch_offers()
+    if not offers:
+        die("No pending offers to accept. (See them with 'ccp offers'.)")
+
+    offer = pick_offer(offers, args.offer_id)
+    if offer is None:
+        # Convenience: `ccp accept ~/dir` — the lone argument is really a
+        # destination directory, so accept the newest offer into it.
+        maybe_dir = os.path.expanduser(args.offer_id or "")
+        if args.offer_id and args.dir is None and os.path.isdir(maybe_dir):
+            args.dir = args.offer_id
+            offer = pick_offer(offers, None)
+        else:
+            die("No pending offer matches '%s'. See 'ccp offers'."
+                % args.offer_id)
+
+    body = {}
+    if args.dir:
+        # dir omitted => no "dest" key, so the daemon uses its receive_dir.
+        body["dest"] = os.path.abspath(os.path.expanduser(args.dir))
+
+    r = api_post("/api/offers/%s/accept" % offer["offer_id"], body,
+                 timeout=600)
+    if r.status_code == 404:
+        die("That offer is gone — it may have expired or been withdrawn.")
+    if r.status_code == 502:
+        die("Transfer failed — could not pull the files from %s."
+            % offer_from_name(offer))
+    if not r.ok:
+        die("Accept failed: %s" % api_error_message(r))
+    result = r.json()
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return
+
+    src_name = offer_from_name(offer)
+    if result.get("kind") == "text":
+        # Verbatim to stdout so it pipes; the info line goes to stderr
+        # (exactly like `ccp paste` with a text clipboard).
+        text = result.get("text", "")
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        err("📥 from %s" % src_name)
+        return
+
+    files = result.get("files_written", [])
+    print("📥 Accepted %s (%s) from %s"
+          % (plural(len(files), "file"),
+             human_size(result.get("total_bytes",
+                                   offer.get("total_size", 0))),
+             src_name))
+    for f in files:
+        print("   %s" % f)
+
+
+def cmd_decline(args):
+    ensure_daemon()
+    offers = fetch_offers()
+    if not offers:
+        die("No pending offers to decline.")
+
+    offer = pick_offer(offers, args.offer_id)
+    if offer is None:
+        die("No pending offer matches '%s'. See 'ccp offers'." % args.offer_id)
+
+    r = api_post("/api/offers/%s/decline" % offer["offer_id"])
+    if r.status_code == 404:
+        die("That offer is gone — it may have already expired.")
+    if not r.ok:
+        die("Decline failed: %s" % api_error_message(r))
+    print("🚫 Declined %s from %s."
+          % (offer_contents(offer), offer_from_name(offer)))
+
+
+def cmd_widget(args):
+    ensure_daemon()
+    try:
+        from crosscopy import widget
+    except ImportError:
+        die("The tray widget isn't available in this install.\n"
+            '   Install the extras:  pip install "cross-copy[widget]"\n'
+            '   (pipx users:  pipx install "cross-copy[widget]" --force)')
+    # Missing optional deps (pystray/Pillow) are handled inside widget.main()
+    # with a friendly install hint.
+    widget.main()
 
 
 def cmd_devices(args):
@@ -492,6 +852,15 @@ def cmd_status(args):
     else:
         print("📋 Clipboard: empty")
 
+    # Older daemons don't report an "update" key — that's fine.
+    update = status.get("update") or {}
+    if isinstance(update, dict) and update.get("available") and update.get("latest"):
+        if update.get("auto_update"):
+            hint = "auto-update will install it"
+        else:
+            hint = "run 'ccp update'"
+        print("⬆️  Update v%s available — %s" % (update["latest"], hint))
+
 
 def cmd_clear(args):
     ensure_daemon()
@@ -556,6 +925,122 @@ def _write_name_to_config(new_name):
 
 
 # ---------------------------------------------------------------------------
+# Updates (`ccp update`) — see SPEC.md "Updates & auto-update (v0.3)"
+# ---------------------------------------------------------------------------
+
+def update_url():
+    return os.environ.get("CROSSCOPY_UPDATE_URL") or UPDATE_URL_DEFAULT
+
+
+def update_pkg():
+    return os.environ.get("CROSSCOPY_UPDATE_PKG") or UPDATE_PKG_DEFAULT
+
+
+def version_tuple(version):
+    """'0.3.0' -> (0, 3, 0) for comparison; unparseable -> (0,)."""
+    parts = re.findall(r"\d+", version or "")
+    return tuple(int(p) for p in parts) or (0,)
+
+
+def fetch_latest_version():
+    """Fetch the published version string, or die with a friendly error."""
+    url = update_url()
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        die("Could not check for updates — is the network up?\n"
+            "   %s\n   (%s)" % (url, e))
+    m = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', r.text)
+    if not m:
+        die("Could not find a version number at %s" % url)
+    return m.group(1)
+
+
+def run_self_update():
+    """pip-install the latest package. Dies (with pip's tail) on failure."""
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if sys.prefix == sys.base_prefix:  # not in a venv
+        cmd.append("--user")
+    cmd.append(update_pkg())
+    code, output = run_cmd(cmd)
+    if code != 0:
+        tail = "\n".join(output.splitlines()[-15:])
+        die("Update failed: pip exited with code %d.%s"
+            % (code, ("\n--- pip output (last lines) ---\n%s" % tail)
+               if tail else ""))
+
+
+def restart_daemon_after_update():
+    """Stop the running daemon so the new code loads.
+
+    If a systemd/launchd service is installed, its Restart/KeepAlive policy
+    brings the daemon back by itself — poll ping briefly and only spawn one
+    manually if nothing came back.
+    """
+    info = read_daemon_json()
+    pid = (info or {}).get("pid")
+    try:
+        pid = int(pid) if pid else None
+    except (TypeError, ValueError):
+        pid = None
+    if pid and pid_alive(pid):
+        error = terminate_pid(pid)
+        if error:
+            err(error)
+            err("Restart it manually to load the new version: "
+                "ccp daemon stop && ccp daemon start")
+            return
+    if wait_for_ping(3.0):  # service manager restarted it
+        return
+    spawn_daemon()
+    if not wait_for_ping():
+        err("The daemon did not come back after the update. "
+            "Start it with 'ccp daemon start'.")
+
+
+def cmd_update(args):
+    current = __version__
+    latest = fetch_latest_version()
+    available = version_tuple(latest) > version_tuple(current)
+
+    def emit_json(updated):
+        print(json.dumps({"current": current, "latest": latest,
+                          "available": available, "updated": updated},
+                         indent=2))
+
+    if args.check:
+        if args.json:
+            emit_json(False)
+        elif available:
+            print("⬆️  Update available: %s → %s  (run 'ccp update')"
+                  % (current, latest))
+        else:
+            print("✅ cross-copy %s is up to date" % current)
+        return
+
+    if not available:
+        if args.json:
+            emit_json(False)
+        else:
+            print("✅ cross-copy %s is up to date" % current)
+        return
+
+    if not args.json:
+        print("⬆️  Updating cross-copy %s → %s ..." % (current, latest))
+    was_running = ping() is not None
+    run_self_update()
+    if was_running:
+        if not args.json:
+            print("Restarting the daemon to load the new version...")
+        restart_daemon_after_update()
+    if args.json:
+        emit_json(True)
+    else:
+        print("✅ Updated cross-copy %s → %s" % (current, latest))
+
+
+# ---------------------------------------------------------------------------
 # Daemon autostart (systemd user unit / launchd agent)
 # ---------------------------------------------------------------------------
 
@@ -610,14 +1095,70 @@ def install_systemd():
                                        manual))
 
 
+MACOS_LAUNCHER_NAME = "Cross Copy"
+
+
+def macos_launcher_candidates():
+    """All places a 'Cross Copy' launcher may have been installed."""
+    return [os.path.join(sys.prefix, "bin", MACOS_LAUNCHER_NAME),
+            os.path.join(crosscopy_home(), "bin", MACOS_LAUNCHER_NAME)]
+
+
+def make_macos_launcher():
+    """Create a python launcher named 'Cross Copy' and return its path.
+
+    macOS shows ProgramArguments[0]'s basename in Login Items and firewall
+    prompts — with sys.executable that reads 'Python 3.x'. In a venv/pipx
+    install we drop a real *copy* of the interpreter into <venv>/bin (a
+    copied stub still finds pyvenv.cfg relative to its own directory, so the
+    venv keeps working, and the firewall prompt names 'Cross Copy').
+    Refreshed on every install so upgrades keep working. Outside a venv we
+    fall back to a symlink under ~/.crosscopy/bin (fixes Login Items at
+    least), and to plain sys.executable as a last resort.
+    """
+    if sys.prefix != sys.base_prefix:  # venv / pipx — the common install
+        bin_dir = os.path.join(sys.prefix, "bin")
+        launcher = os.path.join(bin_dir, MACOS_LAUNCHER_NAME)
+        if os.access(bin_dir, os.W_OK):
+            try:
+                if os.path.lexists(launcher):
+                    os.remove(launcher)
+                shutil.copy2(sys.executable, launcher)
+                os.chmod(launcher, 0o755)
+                return launcher
+            except OSError:
+                pass
+    try:
+        bin_dir = os.path.join(crosscopy_home(), "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        launcher = os.path.join(bin_dir, MACOS_LAUNCHER_NAME)
+        if os.path.lexists(launcher):
+            os.remove(launcher)
+        os.symlink(sys.executable, launcher)
+        return launcher
+    except OSError:
+        return sys.executable
+
+
+def remove_macos_launcher():
+    """Best-effort removal of any 'Cross Copy' launcher we installed."""
+    for path in macos_launcher_candidates():
+        try:
+            if os.path.lexists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def install_launchd():
     home = crosscopy_home()
     os.makedirs(home, exist_ok=True)
     log_path = os.path.join(home, "daemon.log")
 
+    launcher = make_macos_launcher()
     plist = {
         "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [sys.executable, "-m", "crosscopy.daemon"],
+        "ProgramArguments": [launcher, "-m", "crosscopy.daemon"],
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "StandardOutPath": log_path,
@@ -636,17 +1177,24 @@ def install_launchd():
     print("Wrote %s" % plist_path)
 
     uid = os.getuid()
-    # Unload any previously-loaded copy first (ignore failures).
-    run_cmd(["launchctl", "bootout", "gui/%d" % uid, plist_path])
-    code, output = run_cmd(["launchctl", "bootstrap", "gui/%d" % uid,
-                            plist_path])
+    # Unload any previously-loaded copy first (ignore failures) — bootstrap
+    # errors out with "already loaded" otherwise.
+    run_launchctl(["bootout", "gui/%d/%s" % (uid, LAUNCHD_LABEL)])
+    code, bootstrap_out = run_launchctl(["bootstrap", "gui/%d" % uid,
+                                         plist_path])
     if code != 0:
         # Older macOS: fall back to launchctl load -w.
-        code, output = run_cmd(["launchctl", "load", "-w", plist_path])
+        code, load_out = run_launchctl(["load", "-w", plist_path])
         if code != 0:
+            details = []
+            if bootstrap_out:
+                details.append("launchctl bootstrap: %s" % bootstrap_out)
+            if load_out:
+                details.append("launchctl load -w: %s" % load_out)
             die("launchctl could not load the service%s\n"
                 "Set up autostart manually, or run 'ccp daemon start' "
-                "after login." % ((":\n%s" % output) if output else "."))
+                "after login."
+                % ((":\n%s" % "\n".join(details)) if details else "."))
 
 
 def cmd_daemon_install():
@@ -683,15 +1231,22 @@ def cmd_daemon_uninstall():
         removed = False
         if os.path.exists(plist_path):
             uid = os.getuid()
-            code, _ = run_cmd(["launchctl", "bootout", "gui/%d" % uid,
-                               plist_path])
+            # Best-effort unload: by label first (modern), then by plist
+            # path, then legacy unload. Failures are fine — it may simply
+            # not be loaded.
+            code, _ = run_launchctl(["bootout",
+                                     "gui/%d/%s" % (uid, LAUNCHD_LABEL)])
             if code != 0:
-                run_cmd(["launchctl", "unload", plist_path])
+                code, _ = run_launchctl(["bootout", "gui/%d" % uid,
+                                         plist_path])
+            if code != 0:
+                run_launchctl(["unload", plist_path])
             try:
                 os.remove(plist_path)
                 removed = True
             except OSError as e:
                 die("Could not remove %s: %s" % (plist_path, e))
+        remove_macos_launcher()
         if removed:
             print("✅ Autostart removed (%s)." % plist_path)
         else:
@@ -699,7 +1254,10 @@ def cmd_daemon_uninstall():
     elif sys.platform.startswith("linux"):
         unit_path = systemd_unit_path()
         had_unit = os.path.exists(unit_path)
-        if shutil.which("systemctl"):
+        # Only touch systemd when THIS home's unit file exists — with a
+        # custom $HOME/CROSSCOPY_HOME, disabling unconditionally could stop
+        # a different install's live service.
+        if had_unit and shutil.which("systemctl"):
             run_cmd(["systemctl", "--user", "disable", "--now",
                      SYSTEMD_UNIT_NAME])
         if had_unit:
@@ -720,6 +1278,12 @@ def cmd_daemon_uninstall():
 def cmd_daemon(args):
     action = args.action
     if action == "run":
+        # Neutral CWD so a crosscopy/ dir here can't shadow the installed
+        # package (matches spawn_daemon).
+        try:
+            os.chdir(os.path.expanduser("~"))
+        except OSError:
+            pass
         os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
     elif action == "start":
         if ping():
@@ -779,6 +1343,15 @@ def cmd_ui(args):
 
 def cmd_version(args):
     print("cross-copy %s" % __version__)
+    # Free update hint only: ask an *already-running* local daemon for its
+    # cached update state. Never start the daemon or touch the internet here.
+    try:
+        r = requests.get(base_url() + "/api/status", timeout=0.8)
+        update = (r.json() or {}).get("update") or {}
+    except (requests.RequestException, ValueError):
+        return
+    if isinstance(update, dict) and update.get("available") and update.get("latest"):
+        print("⬆️  Update v%s available — run 'ccp update'" % update["latest"])
 
 
 # ---------------------------------------------------------------------------
@@ -813,6 +1386,42 @@ def build_parser():
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_paste)
 
+    p = sub.add_parser(
+        "send",
+        help="offer files or text to one device — they must accept "
+             "(AirDrop-style)")
+    p.add_argument("paths", nargs="*", metavar="path-or-text")
+    p.add_argument("-t", "--text", action="store_true",
+                   help="treat the arguments as text, not paths")
+    p.add_argument("--to", metavar="NAME_OR_ID",
+                   help="target device (optional when there is exactly "
+                        "one other device)")
+    p.add_argument("--json", action="store_true",
+                   help="print the final offer object as JSON")
+    p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("offers", help="list pending incoming offers")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_offers)
+
+    p = sub.add_parser("accept",
+                       help="accept a pending offer (newest if no id)")
+    p.add_argument("offer_id", nargs="?", default=None,
+                   help="offer id — a short prefix is enough (default: "
+                        "newest offer)")
+    p.add_argument("dir", nargs="?", default=None,
+                   help="destination directory (default: your receive "
+                        "folder, ~/Downloads/cross-copy)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_accept)
+
+    p = sub.add_parser("decline",
+                       help="decline a pending offer (newest if no id)")
+    p.add_argument("offer_id", nargs="?", default=None,
+                   help="offer id — a short prefix is enough (default: "
+                        "newest offer)")
+    p.set_defaults(func=cmd_decline)
+
     p = sub.add_parser("devices", aliases=["list"],
                        help="list cross-copy devices on the network")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -846,6 +1455,19 @@ def build_parser():
 
     p = sub.add_parser("ui", help="open the web UI in a browser")
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser(
+        "widget",
+        help='run the menu-bar/tray widget (needs: pip install '
+             '"cross-copy[widget]")')
+    p.set_defaults(func=cmd_widget)
+
+    p = sub.add_parser("update",
+                       help="update cross-copy to the latest version")
+    p.add_argument("--check", action="store_true",
+                   help="only check whether an update is available")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("version", help="show version")
     p.set_defaults(func=cmd_version)

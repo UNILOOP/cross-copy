@@ -2,16 +2,24 @@
 (function () {
   "use strict";
 
-  var POLL_MS = 5000;
+  var POLL_MS = 30000;            // slow fallback poll; SSE drives instant updates
+  var REFRESH_DEBOUNCE_MS = 250;  // coalesce SSE event bursts into one refetch
+  var SEND_POLL_MS = 1500;        // outgoing-offer status polling
+  var SEND_POLL_MAX = 200;        // ~300 s, matches offer expiry
   var DEST_KEY = "crosscopy.dest";
+  var UPDATE_DISMISS_KEY = "crosscopy.updateDismissed";
 
   var $ = function (id) { return document.getElementById(id); };
 
   var els = {
     banner: $("reconnect-banner"),
+    updateBanner: $("update-banner"),
+    updateText: $("update-text"),
+    updateDismiss: $("update-dismiss"),
     deviceName: $("device-name"),
     devicePlatform: $("device-platform"),
     daemonVersion: $("daemon-version"),
+    localTitle: $("local-card-title"),
     localClipboard: $("local-clipboard"),
     opBadge: $("local-op-badge"),
     clearBtn: $("clear-btn"),
@@ -25,8 +33,9 @@
     tabText: $("tab-text"),
     textPane: $("text-pane"),
     textInput: $("text-input"),
-    copyTextBtn: $("copy-text-btn"),
+    shareTextBtn: $("copy-text-btn"),
     destInput: $("dest-input"),
+    offersStack: $("offers-stack"),
     peersList: $("peers-list"),
     addPeerForm: $("add-peer-form"),
     peerHost: $("peer-host"),
@@ -36,9 +45,15 @@
   };
 
   var state = {
-    busy: false,          // upload/paste in flight -> pause polling
+    busy: false,          // upload/receive in flight -> pause refetching
     connected: true,
-    pollTimer: null
+    pollTimer: null,
+    refreshTimer: null,   // pending debounced refresh
+    es: null,             // EventSource, when connected
+    sseOpened: false,     // stream has successfully opened at least once
+    sendStatus: {},       // peer id -> {text, cls}; survives re-renders
+    sendDraft: {},        // peer id -> unsent text draft; survives re-renders
+    watch: {}             // offer id -> interval handle (outgoing status poll)
   };
 
   /* ---------- helpers ---------- */
@@ -67,6 +82,11 @@
     if (platform === "darwin") return "🍎"; // apple
     if (platform === "linux") return "🐧";  // penguin
     return "💻";                            // laptop
+  }
+
+  function opBadgeText(op) {
+    // Internal API ops stay "copy"/"move"; the UI speaks share language.
+    return op === "move" ? "move (removes from sender)" : "share";
   }
 
   function el(tag, className, text) {
@@ -143,33 +163,290 @@
     return wrap;
   }
 
+  function renderUpdate(update) {
+    // `update` may be absent on older daemons — never crash, just hide.
+    if (!update || update.available !== true || !update.latest) {
+      els.updateBanner.classList.add("hidden");
+      return;
+    }
+    var latest = String(update.latest);
+    if (localStorage.getItem(UPDATE_DISMISS_KEY) === latest) {
+      els.updateBanner.classList.add("hidden");
+      return;
+    }
+    els.updateBanner.dataset.version = latest;
+    els.updateText.textContent = "";
+    els.updateText.appendChild(document.createTextNode(
+      "Update v" + latest + " available — "));
+    if (update.auto_update) {
+      els.updateText.appendChild(document.createTextNode("installing automatically soon"));
+    } else {
+      els.updateText.appendChild(document.createTextNode("run "));
+      els.updateText.appendChild(el("code", null, "ccp update"));
+      els.updateText.appendChild(document.createTextNode(" in a terminal"));
+    }
+    els.updateBanner.classList.remove("hidden");
+  }
+
   function renderLocal(status) {
     els.deviceName.textContent = status.name || "?";
     els.devicePlatform.textContent = platformIcon(status.platform) + " " + (status.platform || "");
     els.daemonVersion.textContent = status.version ? "v" + status.version : "";
+    renderUpdate(status.update);
 
     var m = status.clipboard;
+    var hasContent = isTextManifest(m) || (m && m.files && m.files.length);
+    els.localTitle.textContent = hasContent ? "Currently sharing" : "Share from this device";
     els.localClipboard.textContent = "";
-    if (isTextManifest(m)) {
-      els.localClipboard.appendChild(renderTextClip(m, false));
-      els.opBadge.textContent = m.op;
-      els.opBadge.className = "op-badge op-" + m.op;
-      els.clearBtn.classList.remove("hidden");
-    } else if (m && m.files && m.files.length) {
-      els.localClipboard.appendChild(renderFileList(m));
-      els.opBadge.textContent = m.op;
+    if (hasContent) {
+      els.localClipboard.appendChild(
+        isTextManifest(m) ? renderTextClip(m, false) : renderFileList(m));
+      els.opBadge.textContent = opBadgeText(m.op);
       els.opBadge.className = "op-badge op-" + m.op;
       els.clearBtn.classList.remove("hidden");
     } else {
-      var empty = el("p", "empty-state");
-      empty.innerHTML = 'Clipboard is empty. Use <code>ccp copy</code>, drop files, or type text below.';
-      els.localClipboard.appendChild(empty);
+      els.localClipboard.appendChild(el("p", "empty-state",
+        "Nothing shared yet — drop files or type text below."));
       els.opBadge.className = "op-badge hidden";
       els.clearBtn.classList.add("hidden");
     }
   }
 
+  /* ---------- incoming offers (v0.4) ---------- */
+
+  function offerWhat(o) {
+    if (o.kind === "text") {
+      return "some text (" + ((o.text || "").length) + " chars)";
+    }
+    var n = (o.files || []).length;
+    return n + " file" + (n === 1 ? "" : "s") + " (" + humanSize(o.total_size) + ")";
+  }
+
+  function renderOffers(offers) {
+    els.offersStack.textContent = "";
+    offers.forEach(function (o) {
+      var card = el("div", "glass card offer-card");
+
+      var head = el("div", "offer-head");
+      var title = el("div", "offer-title");
+      title.appendChild(el("span", "offer-icon", "📥"));
+      title.appendChild(el("span", "offer-title-text",
+        ((o.from && o.from.name) || "Unknown device") +
+        " wants to send you " + offerWhat(o)));
+      head.appendChild(title);
+      head.appendChild(el("span", "offer-time", relTime(o.created_at)));
+      card.appendChild(head);
+
+      if (o.kind === "text") {
+        card.appendChild(el("div", "text-block preview", o.text || ""));
+      } else {
+        var files = o.files || [];
+        var listWrap = el("div", "offer-files");
+        files.slice(0, 4).forEach(function (f) {
+          var row = el("div", "file-row");
+          row.appendChild(el("span", "file-name", f.rel_path));
+          row.appendChild(el("span", "file-size", humanSize(f.size)));
+          listWrap.appendChild(row);
+        });
+        if (files.length > 4) {
+          listWrap.appendChild(el("div", "offer-more",
+            "+ " + (files.length - 4) + " more"));
+        }
+        card.appendChild(listWrap);
+      }
+
+      var actions = el("div", "offer-actions");
+      var accept = el("button", "btn btn-primary", "Accept");
+      var decline = el("button", "btn btn-danger", "Decline");
+      accept.type = "button";
+      decline.type = "button";
+      accept.addEventListener("click", function () {
+        doAcceptOffer(o, accept, decline);
+      });
+      decline.addEventListener("click", function () {
+        doDeclineOffer(o, accept, decline);
+      });
+      actions.appendChild(accept);
+      actions.appendChild(decline);
+      card.appendChild(actions);
+
+      els.offersStack.appendChild(card);
+    });
+  }
+
+  function doAcceptOffer(offer, acceptBtn, declineBtn) {
+    acceptBtn.disabled = true;
+    declineBtn.disabled = true;
+    acceptBtn.textContent = offer.kind === "text" ? "Getting text…" : "Receiving…";
+    state.busy = true; // keep SSE re-renders from wiping the buttons mid-flight
+    api("/api/offers/" + offer.offer_id + "/accept", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function (res) {
+      var fromName = (res.from && res.from.name) ||
+        (offer.from && offer.from.name) || "peer";
+      if (res.kind === "text") {
+        var text = res.text || "";
+        els.textInput.value = text;
+        updateShareTextBtn();
+        setMode("text");
+        return copyToBrowserClipboard(text).then(function (ok) {
+          toast("Got text (" + text.length + " chars) from " + fromName +
+            (ok ? " — copied to your clipboard" : ""), "success");
+        });
+      }
+      var n = (res.files_written || []).length;
+      toast("Saved " + n + " file" + (n === 1 ? "" : "s") +
+        " (" + humanSize(res.total_bytes) + ") from " + fromName +
+        (res.dest ? " into " + res.dest : ""), "success");
+    }).catch(function (err) {
+      toast("Could not accept: " + err.message, "error");
+    }).then(function () {
+      state.busy = false;
+      refresh();
+    });
+  }
+
+  function doDeclineOffer(offer, acceptBtn, declineBtn) {
+    acceptBtn.disabled = true;
+    declineBtn.disabled = true;
+    api("/api/offers/" + offer.offer_id + "/decline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function () {
+      toast("Declined offer from " +
+        ((offer.from && offer.from.name) || "peer"));
+    }).catch(function () {
+      /* offer likely already gone; refresh sorts it out */
+    }).then(refresh);
+  }
+
+  /* ---------- outgoing targeted send (v0.4) ---------- */
+
+  /* Peer cards are re-rendered on every refresh, so the inline send status
+     lives in state keyed by peer id and is re-applied by renderPeers. */
+  function setSendStatus(peerId, text, cls) {
+    state.sendStatus[peerId] = { text: text, cls: cls || "" };
+    var nodes = els.peersList.querySelectorAll(".send-status");
+    for (var i = 0; i < nodes.length; i++) {
+      if (nodes[i].dataset.peer === peerId) {
+        nodes[i].textContent = text;
+        nodes[i].className = "send-status" + (cls ? " " + cls : "");
+        nodes[i].dataset.peer = peerId;
+      }
+    }
+  }
+
+  function watchSend(offerId, peerId) {
+    if (state.watch[offerId]) return;
+    var ticks = 0;
+    var labels = { pending: "waiting for accept…", accepted: "accepted…",
+                   completed: "delivered", declined: "declined",
+                   failed: "failed", expired: "expired" };
+    function stop() {
+      clearInterval(state.watch[offerId]);
+      delete state.watch[offerId];
+    }
+    state.watch[offerId] = setInterval(function () {
+      ticks++;
+      api("/api/send/" + offerId).then(function (o) {
+        var s = o.status || "pending";
+        setSendStatus(peerId, labels[s] || s,
+          s === "completed" ? "ok" :
+          (s === "declined" || s === "failed" || s === "expired") ? "bad" : "");
+        if (s !== "pending" && s !== "accepted") stop();
+      }).catch(stop);
+      if (ticks >= SEND_POLL_MAX) stop();
+    }, SEND_POLL_MS);
+  }
+
+  function doSendText(peer, input, btn) {
+    var text = input.value;
+    if (!text.trim()) return;
+    btn.disabled = true;
+    setSendStatus(peer.id, "sending…");
+    api("/api/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ peer_id: peer.id, text: text })
+    }).then(function (offer) {
+      setSendStatus(peer.id, "waiting for accept…");
+      delete state.sendDraft[peer.id];
+      input.value = "";
+      if (offer.offer_id) watchSend(offer.offer_id, peer.id);
+    }).catch(function (err) {
+      setSendStatus(peer.id, "failed", "bad");
+      toast("Could not send to " + (peer.name || "peer") + ": " + err.message,
+        "error");
+    }).then(function () {
+      btn.disabled = false;
+    });
+  }
+
+  /* ---------- peers ---------- */
+
+  function buildSendBlock(peer) {
+    var block = el("div", "send-block");
+
+    var labelRow = el("div", "send-label-row");
+    labelRow.appendChild(el("span", "send-label", "Send directly"));
+    var saved = state.sendStatus[peer.id];
+    var status = el("span",
+      "send-status" + (saved && saved.cls ? " " + saved.cls : ""),
+      saved ? saved.text : "");
+    status.dataset.peer = peer.id;
+    labelRow.appendChild(status);
+    block.appendChild(labelRow);
+
+    var row = el("div", "send-row");
+    var input = el("input", "send-input");
+    input.type = "text";
+    input.placeholder = "Text to send to " + (peer.name || "this device") + "…";
+    input.spellcheck = false;
+    input.dataset.peer = peer.id;
+    input.value = state.sendDraft[peer.id] || "";
+    input.addEventListener("input", function () {
+      state.sendDraft[peer.id] = input.value;
+    });
+    var sendBtn = el("button", "btn btn-primary", "Send");
+    sendBtn.type = "button";
+    sendBtn.addEventListener("click", function () {
+      doSendText(peer, input, sendBtn);
+    });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") sendBtn.click();
+    });
+    row.appendChild(input);
+    row.appendChild(sendBtn);
+    block.appendChild(row);
+
+    // Honest capability note: the browser can't hand local file *paths* to
+    // /api/send, so targeted file sends live in the widget / CLI for now.
+    var hint = el("p", "send-hint");
+    hint.appendChild(document.createTextNode(
+      "Text goes straight to this device (they accept first). To send files " +
+      "to just this device, use the tray widget or "));
+    hint.appendChild(el("code", null, "ccp send"));
+    hint.appendChild(document.createTextNode(
+      " — drag & drop above shares with everyone."));
+    block.appendChild(hint);
+
+    return block;
+  }
+
   function renderPeers(peers) {
+    // Preserve focus + caret of a per-peer send input across re-renders.
+    var focusPeer = null, selStart = 0, selEnd = 0;
+    var active = document.activeElement;
+    if (active && active.classList && active.classList.contains("send-input") &&
+        els.peersList.contains(active)) {
+      focusPeer = active.dataset.peer;
+      selStart = active.selectionStart;
+      selEnd = active.selectionEnd;
+    }
+
     els.peersList.textContent = "";
     if (!peers.length) {
       els.peersList.appendChild(el("p", "empty-state",
@@ -178,7 +455,7 @@
       return;
     }
     peers.forEach(function (peer) {
-      var card = el("div", "card peer-card");
+      var card = el("div", "glass card peer-card");
 
       var head = el("div", "peer-head");
       var title = el("div", "peer-title");
@@ -193,42 +470,104 @@
       var m = peer.clipboard;
       var textClip = isTextManifest(m);
       if (textClip || (m && m.files && m.files.length)) {
-        var badge = el("span", "op-badge op-" + m.op, m.op);
+        var badge = el("span", "op-badge op-" + m.op, opBadgeText(m.op));
         head.appendChild(badge);
         card.appendChild(head);
+        card.appendChild(el("div", "peer-sharing-label",
+          (peer.name || peer.id) + " is sharing:"));
         card.appendChild(textClip ? renderTextClip(m, true) : renderFileList(m));
 
         var actions = el("div", "peer-actions");
-        var pasteBtn = el("button", "btn btn-primary",
-          textClip ? "Paste text here" : "Paste here");
-        pasteBtn.type = "button";
-        pasteBtn.addEventListener("click", function () {
-          doPaste(peer, pasteBtn, textClip);
+        var receiveBtn = el("button", "btn btn-primary",
+          textClip ? "Get text" : "Save to this device");
+        receiveBtn.type = "button";
+        receiveBtn.addEventListener("click", function () {
+          doReceive(peer, receiveBtn, textClip);
         });
-        actions.appendChild(pasteBtn);
+        actions.appendChild(receiveBtn);
         card.appendChild(actions);
       } else {
         card.appendChild(head);
-        card.appendChild(el("p", "empty-state small", "Clipboard empty"));
+        card.appendChild(el("p", "empty-state small", "Not sharing anything"));
       }
+
+      card.appendChild(buildSendBlock(peer));
       els.peersList.appendChild(card);
     });
+
+    if (focusPeer) {
+      var inputs = els.peersList.querySelectorAll(".send-input");
+      for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].dataset.peer === focusPeer) {
+          inputs[i].focus();
+          try { inputs[i].setSelectionRange(selStart, selEnd); } catch (e) { /* ok */ }
+          break;
+        }
+      }
+    }
   }
 
-  /* ---------- polling ---------- */
+  /* ---------- refresh: SSE + slow fallback poll ---------- */
 
   function refresh() {
     if (state.busy) return Promise.resolve();
     return Promise.all([
       api("/api/status"),
-      api("/api/peers?with_clipboard=1")
+      api("/api/peers?with_clipboard=1"),
+      // Older daemons have no /api/offers — treat 404 (or any error) as none.
+      api("/api/offers").catch(function () { return { offers: [] }; })
     ]).then(function (results) {
       setConnected(true);
       renderLocal(results[0]);
       renderPeers(results[1].peers || []);
+      renderOffers((results[2] && results[2].offers) || []);
+      // Daemon reachable: if the event stream is down (e.g. it was an older
+      // daemon without /api/events that has since updated), try it again.
+      if (!state.es) connectEvents();
     }).catch(function () {
       setConnected(false);
     });
+  }
+
+  function scheduleRefresh() {
+    // Debounced refresh so bursts of SSE events coalesce into one refetch.
+    if (state.refreshTimer) return;
+    state.refreshTimer = setTimeout(function () {
+      state.refreshTimer = null;
+      refresh();
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  function connectEvents() {
+    if (!window.EventSource || state.es) return;
+    var es = new EventSource("/api/events");
+    state.es = es;
+    state.sseOpened = false;
+    es.onopen = function () {
+      state.sseOpened = true;
+      setConnected(true);
+      scheduleRefresh(); // catch anything missed while the stream was down
+    };
+    es.onmessage = function () {
+      scheduleRefresh();
+    };
+    es.onerror = function () {
+      if (!state.sseOpened) {
+        // Never got a stream — the endpoint is probably missing (older
+        // daemon, mixed versions). Stay quiet: no banner, the fallback poll
+        // carries the day, and each successful poll retries the stream.
+        es.close();
+        if (state.es === es) state.es = null;
+        return;
+      }
+      // Had a live stream and lost it — daemon likely went away.
+      setConnected(false);
+      if (es.readyState === EventSource.CLOSED) {
+        // Browser gave up auto-reconnecting; the poll will re-establish.
+        if (state.es === es) state.es = null;
+      }
+      // else: EventSource auto-reconnects; onopen clears the banner.
+    };
   }
 
   function startPolling() {
@@ -253,13 +592,13 @@
     return Promise.resolve(false);
   }
 
-  function doPaste(peer, btn, textMode) {
-    // Text pastes need no destination directory; file pastes keep requiring one.
+  function doReceive(peer, btn, textMode) {
+    // Getting text needs no destination folder; saving files keeps requiring one.
     var body = { peer_id: peer.id };
     if (!textMode) {
       var dest = els.destInput.value.trim();
       if (!dest) {
-        toast("Enter a destination directory first (absolute path).", "error");
+        toast("Enter a folder to save into first (absolute path).", "error");
         els.destInput.focus();
         return;
       }
@@ -269,7 +608,7 @@
     var label = btn.textContent;
     state.busy = true;
     btn.disabled = true;
-    btn.textContent = "Pasting…";
+    btn.textContent = textMode ? "Getting text…" : "Saving…";
     api("/api/paste", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -279,18 +618,19 @@
       if (res.kind === "text") {
         var text = res.text || "";
         els.textInput.value = text;
-        updateCopyTextBtn();
+        updateShareTextBtn();
         setMode("text");
         return copyToBrowserClipboard(text).then(function (ok) {
-          toast("Pasted text (" + text.length + " chars) from " + fromName +
-            (ok ? " — copied to browser clipboard" : ""), "success");
+          toast("Got text (" + text.length + " chars) from " + fromName +
+            (ok ? " — copied to your clipboard" : ""), "success");
         });
       }
       var n = (res.files_written || []).length;
-      toast("Pasted " + n + " file" + (n === 1 ? "" : "s") +
+      toast("Saved " + n + " file" + (n === 1 ? "" : "s") +
         " (" + humanSize(res.total_bytes) + ") from " + fromName, "success");
     }).catch(function (err) {
-      toast("Paste failed: " + err.message, "error");
+      toast((textMode ? "Could not get text: " : "Could not save files: ") +
+        err.message, "error");
     }).then(function () {
       state.busy = false;
       btn.disabled = false;
@@ -299,8 +639,8 @@
     });
   }
 
-  function updateCopyTextBtn() {
-    els.copyTextBtn.disabled = !els.textInput.value.trim();
+  function updateShareTextBtn() {
+    els.shareTextBtn.disabled = !els.textInput.value.trim();
   }
 
   function setMode(mode) {
@@ -313,29 +653,29 @@
     els.textPane.classList.toggle("hidden", !textMode);
   }
 
-  function doCopyText() {
+  function doShareText() {
     var text = els.textInput.value;
     if (!text.trim()) return;
-    els.copyTextBtn.disabled = true;
+    els.shareTextBtn.disabled = true;
     api("/api/copy", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: text, op: "copy" })
     }).then(function () {
-      toast("Copied text (" + text.length + " chars) to the network clipboard", "success");
+      toast("Now sharing text (" + text.length + " chars)", "success");
       els.textInput.value = "";
       refresh();
     }).catch(function (err) {
-      toast("Copy failed: " + err.message, "error");
-    }).then(updateCopyTextBtn);
+      toast("Could not share text: " + err.message, "error");
+    }).then(updateShareTextBtn);
   }
 
-  function doClear() {
+  function doStopSharing() {
     els.clearBtn.disabled = true;
     api("/api/clipboard/clear", { method: "POST" }).then(function () {
-      toast("Clipboard cleared", "success");
+      toast("Stopped sharing", "success");
     }).catch(function (err) {
-      toast("Clear failed: " + err.message, "error");
+      toast("Could not stop sharing: " + err.message, "error");
     }).then(function () {
       els.clearBtn.disabled = false;
       refresh();
@@ -370,8 +710,8 @@
         var manifest = {};
         try { manifest = JSON.parse(xhr.responseText); } catch (e) { /* ignore */ }
         var n = (manifest.files || files).length;
-        toast("Copied " + n + " file" + (n === 1 ? "" : "s") +
-          " (" + humanSize(manifest.total_size) + ") to the network clipboard", "success");
+        toast("Now sharing " + n + " file" + (n === 1 ? "" : "s") +
+          " (" + humanSize(manifest.total_size) + ")", "success");
       } else {
         toast("Upload failed (HTTP " + xhr.status + ")", "error");
       }
@@ -407,15 +747,22 @@
     });
   }
 
+  function dismissUpdate() {
+    var v = els.updateBanner.dataset.version;
+    if (v) localStorage.setItem(UPDATE_DISMISS_KEY, v);
+    els.updateBanner.classList.add("hidden");
+  }
+
   /* ---------- wiring ---------- */
 
-  els.clearBtn.addEventListener("click", doClear);
+  els.clearBtn.addEventListener("click", doStopSharing);
   els.addPeerForm.addEventListener("submit", doAddPeer);
+  els.updateDismiss.addEventListener("click", dismissUpdate);
 
   els.tabFiles.addEventListener("click", function () { setMode("files"); });
   els.tabText.addEventListener("click", function () { setMode("text"); });
-  els.textInput.addEventListener("input", updateCopyTextBtn);
-  els.copyTextBtn.addEventListener("click", doCopyText);
+  els.textInput.addEventListener("input", updateShareTextBtn);
+  els.shareTextBtn.addEventListener("click", doShareText);
 
   els.pickBtn.addEventListener("click", function () { els.fileInput.click(); });
   els.fileInput.addEventListener("change", function () {
@@ -447,11 +794,16 @@
     localStorage.setItem(DEST_KEY, els.destInput.value.trim());
   });
 
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") refresh();
+  });
+
   /* ---------- init ---------- */
 
   var savedDest = localStorage.getItem(DEST_KEY);
   if (savedDest) els.destInput.value = savedDest;
 
   refresh();
+  connectEvents();
   startPolling();
 })();

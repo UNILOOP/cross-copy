@@ -1,0 +1,282 @@
+/* cross-copy widget panel — vanilla JS, no dependencies. */
+(function () {
+  "use strict";
+
+  var POLL_MS = 30000;           // slow fallback poll; SSE drives live updates
+  var DEBOUNCE_MS = 250;         // coalesce SSE bursts into one refetch
+  var SEND_POLL_MS = 1500;       // outgoing-offer status polling
+  var SEND_POLL_MAX = 200;       // ~300 s, matches offer expiry
+
+  var els = {
+    name: document.getElementById("device-name"),
+    dot: document.getElementById("live-dot"),
+    offers: document.getElementById("offers"),
+    peers: document.getElementById("peers"),
+    toasts: document.getElementById("toasts")
+  };
+
+  var state = { es: null, opened: false, timer: null, watch: {}, sendStatus: {} };
+
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = text;
+    return n;
+  }
+
+  function toast(msg, kind) {
+    var t = el("div", "toast " + (kind || ""), msg);
+    els.toasts.appendChild(t);
+    void t.offsetWidth;
+    t.classList.add("show");
+    setTimeout(function () {
+      t.classList.remove("show");
+      setTimeout(function () { t.remove(); }, 300);
+    }, 4000);
+  }
+
+  function humanSize(bytes) {
+    if (!bytes && bytes !== 0) return "?";
+    var units = ["B", "KB", "MB", "GB"], i = 0, n = bytes;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+  }
+
+  function platformIcon(p) {
+    return p === "darwin" ? "🍎" : p === "linux" ? "🐧" : "💻";
+  }
+
+  function api(path, options) {
+    return fetch(path, options).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (!res.ok) {
+          var e = new Error(body && body.error ? body.error : "HTTP " + res.status);
+          e.status = res.status;
+          throw e;
+        }
+        return body;
+      });
+    });
+  }
+
+  /* ---------- offers ---------- */
+
+  function offerSummary(o) {
+    if (o.kind === "text") {
+      var t = o.text || "";
+      var prev = t.replace(/\s+/g, " ").slice(0, 60);
+      return "text (" + t.length + " chars) “" + prev + (t.length > 60 ? "…" : "") + "”";
+    }
+    var n = (o.files || []).length;
+    return n + " file" + (n === 1 ? "" : "s") + " · " + humanSize(o.total_size);
+  }
+
+  function renderOffers(offers) {
+    els.offers.textContent = "";
+    offers.forEach(function (o) {
+      var card = el("div", "glass offer");
+      card.appendChild(el("div", "offer-from",
+        "📥 " + ((o.from && o.from.name) || "?") + " wants to send"));
+      card.appendChild(el("div", "offer-what", offerSummary(o)));
+      var actions = el("div", "offer-actions");
+      var accept = el("button", "btn btn-primary", "Accept");
+      var decline = el("button", "btn btn-danger", "Decline");
+      accept.addEventListener("click", function () {
+        accept.disabled = decline.disabled = true;
+        accept.textContent = "Receiving…";
+        api("/api/offers/" + o.offer_id + "/accept", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: "{}"
+        }).then(function (res) {
+          toast(res.kind === "text"
+            ? "Got text (" + (res.text || "").length + " chars)"
+            : "Saved " + (res.files_written || []).length + " file(s)", "success");
+        }).catch(function (err) {
+          toast("Accept failed: " + err.message, "error");
+        }).then(refresh);
+      });
+      decline.addEventListener("click", function () {
+        accept.disabled = decline.disabled = true;
+        api("/api/offers/" + o.offer_id + "/decline", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: "{}"
+        }).catch(function () {}).then(refresh);
+      });
+      actions.appendChild(accept);
+      actions.appendChild(decline);
+      card.appendChild(actions);
+      els.offers.appendChild(card);
+    });
+  }
+
+  /* ---------- outgoing send + status watch ---------- */
+
+  /* Rows are re-rendered on every refresh, so the inline status lives in
+     state (keyed by peer id) and is re-applied by renderPeers. */
+  function setPeerStatus(peerId, text, cls) {
+    state.sendStatus[peerId] = { text: text, cls: cls || "" };
+    var rows = els.peers.querySelectorAll(".peer");
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.peer === peerId) {
+        var s = rows[i].querySelector(".peer-status");
+        s.textContent = text;
+        s.className = "peer-status " + (cls || "");
+      }
+    }
+  }
+
+  function watchSend(offerId, peerId) {
+    if (state.watch[offerId]) return;
+    var ticks = 0;
+    var labels = { pending: "waiting…", accepted: "accepted…",
+                   completed: "delivered", declined: "declined",
+                   failed: "failed", expired: "expired" };
+    state.watch[offerId] = setInterval(function () {
+      ticks++;
+      api("/api/send/" + offerId).then(function (o) {
+        var s = o.status || "pending";
+        setPeerStatus(peerId, labels[s] || s,
+          s === "completed" ? "ok" :
+          (s === "declined" || s === "failed" || s === "expired") ? "bad" : "");
+        if (s !== "pending" && s !== "accepted") stop();
+      }).catch(stop);
+      if (ticks >= SEND_POLL_MAX) stop();
+    }, SEND_POLL_MS);
+    function stop() {
+      clearInterval(state.watch[offerId]);
+      delete state.watch[offerId];
+    }
+  }
+
+  function doSend(peer, body, done) {
+    setPeerStatus(peer.id, "sending…");
+    api("/api/send", body).then(function (offer) {
+      setPeerStatus(peer.id, "waiting…");
+      if (offer.offer_id) watchSend(offer.offer_id, peer.id);
+    }).catch(function (err) {
+      setPeerStatus(peer.id, "failed", "bad");
+      toast("Send to " + peer.name + " failed: " + err.message, "error");
+    }).then(done);
+  }
+
+  /* ---------- peers ---------- */
+
+  function renderPeers(peers) {
+    els.peers.textContent = "";
+    if (!peers.length) {
+      els.peers.appendChild(el("p", "empty", "No devices found on the network."));
+      return;
+    }
+    peers.forEach(function (peer) {
+      var row = el("div", "peer");
+      row.dataset.peer = peer.id;
+      var head = el("div", "peer-head");
+      head.appendChild(el("span", null, platformIcon(peer.platform)));
+      head.appendChild(el("span", "peer-name", peer.name || peer.id));
+      var saved = state.sendStatus[peer.id];
+      var status = el("span",
+        "peer-status" + (saved && saved.cls ? " " + saved.cls : ""),
+        saved ? saved.text : "");
+      head.appendChild(status);
+      row.appendChild(head);
+
+      var send = el("div", "peer-send");
+      var input = el("input");
+      input.type = "text";
+      input.placeholder = "Send text…";
+      var sendBtn = el("button", "btn btn-primary", "Send");
+      sendBtn.addEventListener("click", function () {
+        var text = input.value;
+        if (!text.trim()) return;
+        sendBtn.disabled = true;
+        doSend(peer, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ peer_id: peer.id, text: text })
+        }, function () { sendBtn.disabled = false; input.value = ""; });
+      });
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") sendBtn.click();
+      });
+
+      var fileBtn = el("label", "btn file-btn", "📁");
+      fileBtn.title = "Send files…";
+      var fileInput = el("input");
+      fileInput.type = "file";
+      fileInput.multiple = true;
+      fileInput.addEventListener("change", function () {
+        if (!fileInput.files.length) return;
+        var form = new FormData();
+        form.append("peer_id", peer.id);
+        Array.prototype.forEach.call(fileInput.files, function (f) {
+          form.append("files", f, f.name);
+        });
+        fileInput.value = "";
+        doSend(peer, { method: "POST", body: form }, function () {});
+      });
+      fileBtn.appendChild(fileInput);
+
+      send.appendChild(input);
+      send.appendChild(sendBtn);
+      send.appendChild(fileBtn);
+      row.appendChild(send);
+      els.peers.appendChild(row);
+    });
+  }
+
+  /* ---------- refresh: SSE + slow fallback poll ---------- */
+
+  function refresh() {
+    return Promise.all([
+      api("/api/status"),
+      api("/api/peers?with_clipboard=1"),
+      api("/api/offers").catch(function () { return { offers: [] }; })
+    ]).then(function (r) {
+      els.name.textContent = r[0].name || "cross-copy";
+      renderPeers(r[1].peers || []);
+      renderOffers(r[2].offers || []);
+      if (!state.es) connectEvents();
+    }).catch(function () {
+      setLive(false);
+    });
+  }
+
+  function scheduleRefresh() {
+    if (state.timer) return;
+    state.timer = setTimeout(function () {
+      state.timer = null;
+      refresh();
+    }, DEBOUNCE_MS);
+  }
+
+  function setLive(ok) {
+    els.dot.classList.toggle("live", ok);
+    els.dot.title = ok ? "live" : "disconnected";
+  }
+
+  function connectEvents() {
+    if (!window.EventSource || state.es) return;
+    var es = new EventSource("/api/events");
+    state.es = es;
+    state.opened = false;
+    es.onopen = function () {
+      state.opened = true;
+      setLive(true);
+      scheduleRefresh();
+    };
+    es.onmessage = scheduleRefresh;
+    es.onerror = function () {
+      setLive(false);
+      if (!state.opened || es.readyState === EventSource.CLOSED) {
+        es.close();
+        if (state.es === es) state.es = null; // poll re-establishes
+      }
+    };
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") refresh();
+  });
+
+  refresh();
+  connectEvents();
+  setInterval(refresh, POLL_MS);
+})();

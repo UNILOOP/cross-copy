@@ -23,11 +23,22 @@ REMOVED_SOMETHING=0
 #    plist). Fall back to removing leftover service files by hand only if the
 #    `ccp` binary is already gone.
 # ---------------------------------------------------------------------------
+# Prefer this HOME's install ($BIN_LINK) over whatever `ccp` happens to be
+# on PATH — with multiple installs (or a customised $HOME) `command -v ccp`
+# can resolve to a *different* install, and its `daemon uninstall` would
+# tear down that install's service instead of this one's.
 CCP_BIN=""
-if command -v ccp >/dev/null 2>&1; then
-    CCP_BIN="$(command -v ccp)"
-elif [ -x "$BIN_LINK" ]; then
+if [ -x "$BIN_LINK" ]; then
     CCP_BIN="$BIN_LINK"
+elif command -v ccp >/dev/null 2>&1; then
+    # Only trust a PATH-found ccp that lives under this $HOME; a ccp from
+    # somewhere else belongs to a different install and must not have its
+    # service/daemon torn down by this uninstaller.
+    CCP_ON_PATH="$(command -v ccp)"
+    case "$CCP_ON_PATH" in
+        "$HOME"/*) CCP_BIN="$CCP_ON_PATH" ;;
+        *) warn "Found ccp at $CCP_ON_PATH (outside $HOME) — leaving that install alone." ;;
+    esac
 fi
 
 if [ -n "$CCP_BIN" ]; then
@@ -58,12 +69,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Remove the package: pipx install, or venv + symlink
+# 2. Remove the package: pipx install, or venv + symlink
 # ---------------------------------------------------------------------------
-if command -v pipx >/dev/null 2>&1 && pipx list 2>/dev/null | grep -q 'cross-copy'; then
-    info "Uninstalling pipx package cross-copy ..."
-    pipx uninstall cross-copy
-    REMOVED_SOMETHING=1
+# Note: capture `pipx list` output instead of piping into grep -q: with
+# `set -o pipefail`, grep -q exiting early can SIGPIPE pipx (exit 141) and
+# make the check false even when the package IS installed.
+if command -v pipx >/dev/null 2>&1; then
+    PIPX_LIST="$(pipx list 2>/dev/null || true)"
+    case "$PIPX_LIST" in
+        *cross-copy*)
+            info "Uninstalling pipx package cross-copy ..."
+            pipx uninstall cross-copy
+            REMOVED_SOMETHING=1
+            ;;
+    esac
 fi
 
 if [ -d "$VENV_DIR" ]; then
@@ -84,7 +103,7 @@ if [ "$REMOVED_SOMETHING" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Optionally remove data directory (default: keep)
+# 3. Optionally remove data directory (default: keep)
 # ---------------------------------------------------------------------------
 if [ -d "$DATA_DIR" ]; then
     REPLY="n"

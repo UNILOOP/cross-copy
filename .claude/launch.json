@@ -6,6 +6,19 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "crosscopy.daemon"],
       "port": 7373
+    },
+    {
+      "name": "crosscopy-integration-a",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "CROSSCOPY_HOME=/tmp/claude-1000/-home-sayeed-projects-cross-copy/87c048ba-9837-4ae2-aba3-97d7139bc554/scratchpad/v4/home-a",
+        "CROSSCOPY_PORT=7501",
+        "CROSSCOPY_NO_MDNS=1",
+        "python3",
+        "-m",
+        "crosscopy.daemon"
+      ],
+      "port": 7501
     }
   ]
 }

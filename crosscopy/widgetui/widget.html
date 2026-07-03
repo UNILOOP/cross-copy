@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cross-copy</title>
+  <link rel="stylesheet" href="/widget/widget.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+  <main class="panel">
+    <header class="glass header">
+      <span class="brand-mark" aria-hidden="true">⧉</span>
+      <div class="head-text">
+        <h1 id="device-name">cross-copy</h1>
+        <span class="sub">cross-copy</span>
+      </div>
+      <span id="live-dot" class="dot" title="disconnected"></span>
+    </header>
+
+    <section id="offers" class="stack" aria-label="Incoming offers"></section>
+
+    <section class="glass peers-card" aria-label="Devices">
+      <h2>Devices</h2>
+      <div id="peers" class="stack"></div>
+    </section>
+  </main>
+  <div id="toasts" aria-live="polite"></div>
+  <script src="/widget/widget.js"></script>
+</body>
+</html>

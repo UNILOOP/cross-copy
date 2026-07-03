@@ -1,30 +1,43 @@
 """cross-copy daemon entry point: `python -m crosscopy.daemon`.
 
 Writes daemon.json ({"pid", "port"}) to the cross-copy home dir, starts
-zeroconf discovery (unless CROSSCOPY_NO_MDNS=1), and runs the Flask server
-bound to 0.0.0.0. Logs to stdout — the CLI's `ccp daemon start` redirects
+zeroconf discovery (unless CROSSCOPY_NO_MDNS=1) plus the reciprocal-hello
+sender loop and the update-check thread, and runs the Flask server bound to
+0.0.0.0. Logs to stdout — the CLI's `ccp daemon start` redirects
 stdout/stderr to ~/.crosscopy/daemon.log. daemon.json is removed on clean
 shutdown (SIGINT/SIGTERM/atexit).
+
+Auto-update: when the updater finds a newer version and config auto_update is
+on, it pip-installs the new package and the daemon re-execs itself
+(os.execv keeps the PID, so systemd/launchd supervision is undisturbed).
 """
 
 import atexit
 import logging
+import os
 import signal
 import sys
 
 from . import __version__, config
 from .discovery import Discovery
 from .server import create_app
+from .updater import Updater
 
 log = logging.getLogger("crosscopy.daemon")
 
-_cleanup_state = {"done": False, "discovery": None}
+_cleanup_state = {"done": False, "discovery": None, "updater": None}
 
 
 def _cleanup():
     if _cleanup_state["done"]:
         return
     _cleanup_state["done"] = True
+    updater = _cleanup_state["updater"]
+    if updater is not None:
+        try:
+            updater.stop()
+        except Exception:
+            pass
     discovery = _cleanup_state["discovery"]
     if discovery is not None:
         try:
@@ -40,6 +53,44 @@ def _handle_signal(signum, frame):
     # Raises SystemExit in the main thread; Flask's serve loop unwinds and
     # atexit runs _cleanup().
     sys.exit(0)
+
+
+def _restart_daemon():
+    """Re-exec the daemon in place after a successful self-update (called
+    from the updater thread). The PID is preserved, so systemd/launchd keep
+    supervising the same process."""
+    log.info("restarting daemon to load the updated code (execv)")
+    discovery = _cleanup_state["discovery"]
+    if discovery is not None:
+        try:
+            discovery.stop()  # cleanly unregister zeroconf before execv
+        except Exception:
+            pass
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # Werkzeug marks its listening socket inheritable and exports
+    # WERKZEUG_SERVER_FD; if either survives the execv, the re-exec'd
+    # process fails its bind with "Address already in use" and dies.
+    os.environ.pop("WERKZEUG_SERVER_FD", None)
+    try:
+        max_fd = int(os.sysconf("SC_OPEN_MAX"))
+    except (ValueError, OSError, AttributeError):
+        max_fd = 4096
+    for fd in range(3, min(max_fd, 65536)):
+        try:
+            os.set_inheritable(fd, False)
+        except OSError:
+            pass
+    # Neutral CWD so a crosscopy/ dir in the old CWD can't shadow the
+    # installed package on sys.path.
+    try:
+        os.chdir(os.path.expanduser("~"))
+    except OSError:
+        pass
+    os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
 
 
 def main():
@@ -62,9 +113,14 @@ def main():
 
     discovery = Discovery(port)
     _cleanup_state["discovery"] = discovery
-    discovery.start()
+    discovery.start()        # mDNS register + browse (no-op if disabled)
+    discovery.start_hello()  # reciprocal-hello sender loop
 
-    app = create_app(discovery)
+    updater = Updater()
+    _cleanup_state["updater"] = updater
+    updater.start(restart=_restart_daemon)
+
+    app = create_app(discovery, updater)
 
     log.info("cross-copy %s daemon starting: device=%s (%s) home=%s port=%d",
              __version__, cfg["device_name"], cfg["device_id"], home, port)

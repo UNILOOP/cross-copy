@@ -1,7 +1,9 @@
 """Configuration and home-directory handling for cross-copy.
 
 Everything lives under ~/.crosscopy/ (override with CROSSCOPY_HOME):
-  config.json    device name, device id (uuid4), manual peers list
+  config.json    device name, device id (uuid4), manual peers list,
+                 auto_update flag (default true), receive_dir (default
+                 ~/Downloads/cross-copy), notifications flag (default true)
   daemon.json    written by the running daemon: {"pid": int, "port": int}
   daemon.log     daemon output (written by the CLI's daemon-start redirect)
   staging/       files uploaded through the web UI
@@ -16,6 +18,7 @@ import uuid
 from pathlib import Path
 
 DEFAULT_PORT = 7373
+DEFAULT_RECEIVE_DIR = "~/Downloads/cross-copy"
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +111,15 @@ def load_config() -> dict:
     if not isinstance(cfg.get("manual_peers"), list):
         cfg["manual_peers"] = []
         changed = True
+    if not isinstance(cfg.get("auto_update"), bool):
+        cfg["auto_update"] = True
+        changed = True
+    if not cfg.get("receive_dir") or not isinstance(cfg.get("receive_dir"), str):
+        cfg["receive_dir"] = DEFAULT_RECEIVE_DIR
+        changed = True
+    if not isinstance(cfg.get("notifications"), bool):
+        cfg["notifications"] = True
+        changed = True
     if changed:
         save_config(cfg)
     return cfg
@@ -129,6 +141,23 @@ def set_device_name(name: str) -> None:
     cfg = load_config()
     cfg["device_name"] = name
     save_config(cfg)
+
+
+def get_auto_update() -> bool:
+    """Whether the daemon self-updates automatically (default true)."""
+    return bool(load_config().get("auto_update", True))
+
+
+def get_receive_dir() -> Path:
+    """Where accepted offers land (default ~/Downloads/cross-copy), with
+    ~ expanded. The directory is NOT created here — callers mkdir on use."""
+    raw = load_config().get("receive_dir") or DEFAULT_RECEIVE_DIR
+    return Path(str(raw)).expanduser()
+
+
+def get_notifications() -> bool:
+    """Whether desktop notifications are enabled (default true)."""
+    return bool(load_config().get("notifications", True))
 
 
 # ---------------------------------------------------------------------------
