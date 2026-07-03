@@ -252,7 +252,7 @@ finishes.
 
 ## ⚠️ Security
 
-**v0.4.0 trusts your LAN.** There is no authentication or encryption yet: any
+**v0.4.2 trusts your LAN.** There is no authentication or encryption yet: any
 device on your network can read your cross-copy clipboard (files *and* text)
 and offer you files.
 Use it on networks you trust (home, small office) — **not** on public or
