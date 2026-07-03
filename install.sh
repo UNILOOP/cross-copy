@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./install.sh                 # from a cloned checkout
-#   curl -fsSL https://raw.githubusercontent.com/sayeed99/cross-copy/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.sh | bash
 #
 # Options:
 #   --no-service   skip setting up daemon autostart. By default the installer
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/sayeed99/cross-copy.git}"
+REPO_URL="${REPO_URL:-https://github.com/UNILOOP/cross-copy.git}"
 
 INSTALL_SERVICE=1
 for arg in "$@"; do
