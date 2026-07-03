@@ -8,6 +8,8 @@ guarded __version__).
 import argparse
 import json
 import os
+import plistlib
+import shutil
 import signal
 import subprocess
 import sys
@@ -24,6 +26,11 @@ except Exception:  # pragma: no cover - package may not define it yet
 DEFAULT_PORT = 7373
 PING_TIMEOUT = 2.0
 START_WAIT_SECS = 5.0
+INSTALL_WAIT_SECS = 8.0  # service managers can be slower to start us
+MAX_TEXT_BYTES = 1024 * 1024  # 1 MB, matches the server-side limit
+
+SYSTEMD_UNIT_NAME = "cross-copy"
+LAUNCHD_LABEL = "com.crosscopy.daemon"
 
 
 # ---------------------------------------------------------------------------
@@ -99,13 +106,27 @@ def plural(n, word):
     return "%d %s%s" % (n, word, "" if n == 1 else "s")
 
 
+def text_preview(text, limit=40):
+    """Single-line preview of a text clipboard; newlines shown as ␤."""
+    one_line = (text.replace("\r\n", "␤").replace("\n", "␤")
+                .replace("\r", "␤").replace("\t", " "))
+    if len(one_line) > limit:
+        one_line = one_line[:limit] + "…"
+    return one_line
+
+
 def clipboard_summary(manifest):
-    """Short summary like '3 files, 2.1 MB' or '-'."""
+    """Short summary like '3 files, 2.1 MB', 'text (52 chars) "..."' or '-'."""
     if not manifest:
         return "-"
-    files = manifest.get("files") or []
-    total = manifest.get("total_size", 0)
-    summary = "%s, %s" % (plural(len(files), "file"), human_size(total))
+    if manifest.get("kind") == "text":
+        text = manifest.get("text") or ""
+        summary = 'text (%s) "%s"' % (plural(len(text), "char"),
+                                      text_preview(text))
+    else:
+        files = manifest.get("files") or []
+        total = manifest.get("total_size", 0)
+        summary = "%s, %s" % (plural(len(files), "file"), human_size(total))
     if manifest.get("op") == "move":
         summary += " (move)"
     return summary
@@ -214,22 +235,78 @@ def pid_alive(pid):
         return False
 
 
+def terminate_pid(pid, wait=5.0):
+    """SIGTERM a pid and wait for it to exit. Returns an error string or None."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        return "Failed to stop daemon (pid %d): %s" % (pid, e)
+    deadline = time.time() + wait
+    while time.time() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    if pid_alive(pid):
+        return "Daemon (pid %d) did not exit after SIGTERM." % pid
+    return None
+
+
+def stop_running_daemon():
+    """Best-effort stop of a running daemon (via daemon.json). Dies on failure."""
+    info = read_daemon_json()
+    pid = (info or {}).get("pid")
+    try:
+        pid = int(pid) if pid else None
+    except (TypeError, ValueError):
+        pid = None
+    if pid and pid_alive(pid):
+        print("Stopping the running daemon (pid %d) so the service can take over..."
+              % pid)
+        error = terminate_pid(pid)
+        if error:
+            die(error + "\nStop it manually, then re-run 'ccp daemon install'.")
+
+
+def run_cmd(cmd):
+    """Run a command, capturing output. Returns (returncode, output);
+    returncode -1 if the command could not be executed at all."""
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        return proc.returncode, (proc.stdout or "").strip()
+    except OSError as e:
+        return -1, str(e)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_copy(args, op):
-    paths = []
-    missing = []
-    for p in args.paths:
-        ap = os.path.abspath(p)
-        if os.path.exists(ap):
-            paths.append(ap)
-        else:
-            missing.append(p)
-    if missing:
-        die("No such file or directory: %s" % ", ".join(missing))
+def read_stdin_text():
+    """Read piped stdin as UTF-8 text (up to 1 MB)."""
+    data = sys.stdin.buffer.read(MAX_TEXT_BYTES + 1)
+    if len(data) > MAX_TEXT_BYTES:
+        die("stdin is larger than 1 MB — the text clipboard is capped at 1 MB.\n"
+            "Copy it as a file instead: ccp copy <path>")
+    return data.decode("utf-8", errors="replace")
 
+
+def do_copy_text(text, op):
+    """POST text to /api/copy and print the result."""
+    if not text:
+        die("Nothing to copy: the text is empty.")
+    ensure_daemon()
+    r = api_post("/api/copy", {"text": text, "op": op})
+    if not r.ok:
+        die("Copy failed: %s" % api_error_message(r))
+    verb = "Copied" if op == "copy" else "Cut"
+    print("📝 %s text (%s) to the network clipboard"
+          % (verb, plural(len(text), "char")))
+    print("   Run 'ccp paste' on your other machine.")
+    if op == "move":
+        print("   The clipboard here will clear after the text is pasted.")
+
+
+def do_copy_files(paths, op):
+    """POST file paths to /api/copy and print the result."""
     ensure_daemon()
     r = api_post("/api/copy", {"paths": paths, "op": op})
     if not r.ok:
@@ -242,6 +319,42 @@ def cmd_copy(args, op):
     print("   Run 'ccp paste' on your other machine.")
     if op == "move":
         print("   Files will be removed from this machine after they are pasted.")
+
+
+def cmd_copy(args, op):
+    items = args.paths
+
+    if not items:
+        if sys.stdin.isatty():
+            die("ccp %s: missing paths or text.\n"
+                "Usage: ccp %s <path...>  |  ccp %s --text <words...>  |  "
+                "echo hi | ccp %s" % (op, op, op, op), code=2)
+        do_copy_text(read_stdin_text(), op)
+        return
+
+    if getattr(args, "text", False):
+        do_copy_text(" ".join(items), op)
+        return
+
+    # Path-vs-text detection: all args exist => files, none exist => text,
+    # mixed => refuse and ask the user to disambiguate.
+    paths = []
+    missing = []
+    for p in items:
+        ap = os.path.abspath(p)
+        if os.path.exists(ap):
+            paths.append(ap)
+        else:
+            missing.append(p)
+
+    if not missing:
+        do_copy_files(paths, op)
+    elif not paths:
+        do_copy_text(" ".join(items), op)
+    else:
+        die("Mixed arguments: some exist as paths, but these do not: %s\n"
+            "To send everything as text, use: ccp %s --text ...\n"
+            "Otherwise fix the path and try again." % (", ".join(missing), op))
 
 
 def resolve_peer(name_or_id):
@@ -283,12 +396,27 @@ def cmd_paste(args):
         print(json.dumps(result, indent=2))
         return
 
-    files = result.get("files_written", [])
     src = result.get("from") or {}
+    src_name = src.get("name") or src.get("id") or "unknown device"
+
+    if result.get("kind") == "text":
+        # Verbatim to stdout so `ccp paste > out.txt` / `ccp paste | pbcopy`
+        # work; the info line goes to stderr.
+        text = result.get("text", "")
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        err("📥 from %s" % src_name)
+        if result.get("op") == "move":
+            err("   Source clipboard was cleared on %s." % src_name)
+        return
+
+    files = result.get("files_written", [])
     print("📥 Pasted %s (%s) from %s"
           % (plural(len(files), "file"),
              human_size(result.get("total_bytes", 0)),
-             src.get("name") or src.get("id") or "unknown device"))
+             src_name))
     for f in files:
         print("   %s" % f)
     if result.get("op") == "move":
@@ -427,6 +555,168 @@ def _write_name_to_config(new_name):
         f.write("\n")
 
 
+# ---------------------------------------------------------------------------
+# Daemon autostart (systemd user unit / launchd agent)
+# ---------------------------------------------------------------------------
+
+def systemd_unit_path():
+    return os.path.expanduser("~/.config/systemd/user/%s.service"
+                              % SYSTEMD_UNIT_NAME)
+
+
+def launchd_plist_path():
+    return os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LAUNCHD_LABEL)
+
+
+def install_systemd():
+    manual = ("Set up autostart manually, or just run 'ccp daemon start' "
+              "after login.")
+    if not shutil.which("systemctl"):
+        die("systemd (systemctl) was not found on this system, so autostart "
+            "cannot be set up.\n" + manual)
+
+    env_lines = ""
+    for var in ("CROSSCOPY_PORT", "CROSSCOPY_HOME"):
+        value = os.environ.get(var)
+        if value:
+            env_lines += "Environment=%s=%s\n" % (var, value)
+
+    unit = (
+        "[Unit]\n"
+        "Description=cross-copy network clipboard daemon\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        "ExecStart=%s -m crosscopy.daemon\n"
+        "Restart=on-failure\n"
+        "%s"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    ) % (sys.executable, env_lines)
+
+    unit_path = systemd_unit_path()
+    os.makedirs(os.path.dirname(unit_path), exist_ok=True)
+    with open(unit_path, "w") as f:
+        f.write(unit)
+    print("Wrote %s" % unit_path)
+
+    for cmd in (["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME]):
+        code, output = run_cmd(cmd)
+        if code != 0:
+            die("'%s' failed%s\n%s" % (" ".join(cmd),
+                                       (":\n%s" % output) if output else ".",
+                                       manual))
+
+
+def install_launchd():
+    home = crosscopy_home()
+    os.makedirs(home, exist_ok=True)
+    log_path = os.path.join(home, "daemon.log")
+
+    plist = {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [sys.executable, "-m", "crosscopy.daemon"],
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "StandardOutPath": log_path,
+        "StandardErrorPath": log_path,
+    }
+    env = {var: os.environ[var]
+           for var in ("CROSSCOPY_PORT", "CROSSCOPY_HOME")
+           if os.environ.get(var)}
+    if env:
+        plist["EnvironmentVariables"] = env
+
+    plist_path = launchd_plist_path()
+    os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+    with open(plist_path, "wb") as f:
+        plistlib.dump(plist, f)
+    print("Wrote %s" % plist_path)
+
+    uid = os.getuid()
+    # Unload any previously-loaded copy first (ignore failures).
+    run_cmd(["launchctl", "bootout", "gui/%d" % uid, plist_path])
+    code, output = run_cmd(["launchctl", "bootstrap", "gui/%d" % uid,
+                            plist_path])
+    if code != 0:
+        # Older macOS: fall back to launchctl load -w.
+        code, output = run_cmd(["launchctl", "load", "-w", plist_path])
+        if code != 0:
+            die("launchctl could not load the service%s\n"
+                "Set up autostart manually, or run 'ccp daemon start' "
+                "after login." % ((":\n%s" % output) if output else "."))
+
+
+def cmd_daemon_install():
+    if sys.platform == "darwin":
+        stop_running_daemon()
+        install_launchd()
+        what = "launchd agent"
+    elif sys.platform.startswith("linux"):
+        if not shutil.which("systemctl"):
+            die("systemd (systemctl) was not found on this system, so "
+                "autostart cannot be set up.\n"
+                "Run 'ccp daemon start' after login instead.")
+        stop_running_daemon()
+        install_systemd()
+        what = "systemd user service"
+    else:
+        die("Autostart is only supported on macOS and Linux. "
+            "Use 'ccp daemon start' instead.")
+
+    info = wait_for_ping(INSTALL_WAIT_SECS)
+    if not info:
+        die("The %s was installed, but the daemon did not respond within "
+            "%.0fs.\nCheck %s for details."
+            % (what, INSTALL_WAIT_SECS,
+               os.path.join(crosscopy_home(), "daemon.log")))
+    print("✅ Autostart installed (%s) — daemon running on port %d "
+          "(device '%s')." % (what, daemon_port(), info.get("name", "?")))
+    print("   cross-copy will now start automatically when you log in.")
+
+
+def cmd_daemon_uninstall():
+    if sys.platform == "darwin":
+        plist_path = launchd_plist_path()
+        removed = False
+        if os.path.exists(plist_path):
+            uid = os.getuid()
+            code, _ = run_cmd(["launchctl", "bootout", "gui/%d" % uid,
+                               plist_path])
+            if code != 0:
+                run_cmd(["launchctl", "unload", plist_path])
+            try:
+                os.remove(plist_path)
+                removed = True
+            except OSError as e:
+                die("Could not remove %s: %s" % (plist_path, e))
+        if removed:
+            print("✅ Autostart removed (%s)." % plist_path)
+        else:
+            print("No autostart service was installed; nothing to remove.")
+    elif sys.platform.startswith("linux"):
+        unit_path = systemd_unit_path()
+        had_unit = os.path.exists(unit_path)
+        if shutil.which("systemctl"):
+            run_cmd(["systemctl", "--user", "disable", "--now",
+                     SYSTEMD_UNIT_NAME])
+        if had_unit:
+            try:
+                os.remove(unit_path)
+            except OSError as e:
+                die("Could not remove %s: %s" % (unit_path, e))
+            if shutil.which("systemctl"):
+                run_cmd(["systemctl", "--user", "daemon-reload"])
+            print("✅ Autostart removed (%s)." % unit_path)
+        else:
+            print("No autostart service was installed; nothing to remove.")
+    else:
+        print("Autostart is only supported on macOS and Linux; "
+              "nothing to remove.")
+
+
 def cmd_daemon(args):
     action = args.action
     if action == "run":
@@ -459,16 +749,14 @@ def cmd_daemon(args):
             except OSError:
                 pass
             return
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError as e:
-            die("Failed to stop daemon (pid %d): %s" % (pid, e))
-        deadline = time.time() + 5.0
-        while time.time() < deadline and pid_alive(pid):
-            time.sleep(0.1)
-        if pid_alive(pid):
-            die("Daemon (pid %d) did not exit after SIGTERM." % pid)
+        error = terminate_pid(pid)
+        if error:
+            die(error)
         print("✅ Daemon stopped (pid %d)." % pid)
+    elif action == "install":
+        cmd_daemon_install()
+    elif action == "uninstall":
+        cmd_daemon_uninstall()
     elif action == "status":
         info = ping()
         if info:
@@ -504,12 +792,17 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 
-    p = sub.add_parser("copy", help="put files/dirs on the network clipboard")
-    p.add_argument("paths", nargs="+", metavar="path")
+    p = sub.add_parser("copy",
+                       help="put files/dirs or text on the network clipboard")
+    p.add_argument("paths", nargs="*", metavar="path-or-text")
+    p.add_argument("-t", "--text", action="store_true",
+                   help="treat the arguments as text, not paths")
     p.set_defaults(func=lambda a: cmd_copy(a, "copy"))
 
-    p = sub.add_parser("move", help="like copy, but sources are deleted after paste")
-    p.add_argument("paths", nargs="+", metavar="path")
+    p = sub.add_parser("move", help="like copy, but the source is removed after paste")
+    p.add_argument("paths", nargs="*", metavar="path-or-text")
+    p.add_argument("-t", "--text", action="store_true",
+                   help="treat the arguments as text, not paths")
     p.set_defaults(func=lambda a: cmd_copy(a, "move"))
 
     p = sub.add_parser("paste", help="paste the newest peer clipboard into a directory")
@@ -541,8 +834,14 @@ def build_parser():
     p.add_argument("newname")
     p.set_defaults(func=cmd_name)
 
-    p = sub.add_parser("daemon", help="manage the background daemon")
-    p.add_argument("action", choices=["run", "start", "stop", "status"])
+    p = sub.add_parser(
+        "daemon",
+        help="manage the background daemon (run|start|stop|status|install|uninstall)")
+    p.add_argument("action",
+                   choices=["run", "start", "stop", "status",
+                            "install", "uninstall"],
+                   help="run: foreground; start/stop/status: background daemon; "
+                        "install/uninstall: start-at-login service")
     p.set_defaults(func=cmd_daemon)
 
     p = sub.add_parser("ui", help="open the web UI in a browser")

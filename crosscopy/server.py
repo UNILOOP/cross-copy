@@ -53,8 +53,12 @@ def _fetch_peer_clipboard(peer: dict):
                             timeout=PING_TIMEOUT)
         if resp.status_code == 200:
             manifest = resp.json()
-            if isinstance(manifest, dict) and manifest.get("files"):
-                return manifest
+            if isinstance(manifest, dict):
+                if clipboard.manifest_kind(manifest) == "text":
+                    if manifest.get("text"):
+                        return manifest
+                elif manifest.get("files"):
+                    return manifest
     except Exception:
         pass
     return None
@@ -98,6 +102,16 @@ def _unique_path(path: Path) -> Path:
 
 def _error(message: str, status: int):
     return jsonify({"error": message}), status
+
+
+def _notify_consumed(peer: dict, clipboard_id: str) -> None:
+    """Tell the source we're done (triggers source cleanup for op=move)."""
+    try:
+        requests.post(_peer_url(peer, "/api/clipboard/consumed"),
+                      json={"clipboard_id": clipboard_id},
+                      timeout=CONSUMED_TIMEOUT)
+    except Exception as exc:
+        log.warning("could not notify peer of consumption: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +227,22 @@ def create_app(discovery=None) -> Flask:
     def api_copy():
         body = request.get_json(silent=True) or {}
         paths = body.get("paths")
+        text = body.get("text")
         op = body.get("op", "copy")
-        if not paths or not isinstance(paths, list):
-            return _error("missing 'paths'", 400)
-        try:
-            manifest = clipboard.build_manifest(paths, op=op)
-        except ValueError as exc:
-            return _error(str(exc), 400)
+        if paths is not None and text is not None:
+            return _error("give either 'paths' or 'text', not both", 400)
+        if text is not None:
+            try:
+                manifest = clipboard.build_text_manifest(text, op=op)
+            except ValueError as exc:
+                return _error(str(exc), 400)
+        else:
+            if not paths or not isinstance(paths, list):
+                return _error("missing 'paths' or 'text'", 400)
+            try:
+                manifest = clipboard.build_manifest(paths, op=op)
+            except ValueError as exc:
+                return _error(str(exc), 400)
         clipboard.set_clipboard(manifest)
         log.info("clipboard set: %s (%s)", clipboard.summarize(manifest), op)
         return jsonify(manifest)
@@ -227,12 +250,7 @@ def create_app(discovery=None) -> Flask:
     @app.post("/api/paste")
     def api_paste():
         body = request.get_json(silent=True) or {}
-        dest_raw = body.get("dest")
-        if not dest_raw:
-            return _error("missing 'dest'", 400)
-        dest = Path(str(dest_raw)).expanduser()
-        if not dest.is_absolute():
-            return _error("'dest' must be an absolute path", 400)
+        dest_raw = body.get("dest")  # validated below; ignored for text pastes
         peer_id = body.get("peer_id")
         want_clipboard_id = body.get("clipboard_id")
 
@@ -255,6 +273,24 @@ def create_app(discovery=None) -> Flask:
                    key=lambda p: p["clipboard"].get("created_at", 0.0))
         manifest = peer["clipboard"]
 
+        # Text clipboards: nothing to download, dest is ignored.
+        if clipboard.manifest_kind(manifest) == "text":
+            _notify_consumed(peer, manifest["clipboard_id"])
+            log.info("pasted text (%s) from %s",
+                     config.format_size(manifest.get("total_size", 0)),
+                     peer.get("name"))
+            return jsonify({
+                "from": {"id": peer.get("id"), "name": peer.get("name")},
+                "kind": "text",
+                "text": manifest.get("text", ""),
+                "op": manifest.get("op", "copy"),
+            })
+
+        if not dest_raw:
+            return _error("missing 'dest'", 400)
+        dest = Path(str(dest_raw)).expanduser()
+        if not dest.is_absolute():
+            return _error("'dest' must be an absolute path", 400)
         try:
             dest.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -301,19 +337,14 @@ def create_app(discovery=None) -> Flask:
             log.warning("paste from %s failed: %s", peer.get("name"), exc)
             return _error("transfer failed: %s" % exc, 502)
 
-        # Tell the source we're done (triggers source deletion for op=move).
-        try:
-            requests.post(_peer_url(peer, "/api/clipboard/consumed"),
-                          json={"clipboard_id": manifest["clipboard_id"]},
-                          timeout=CONSUMED_TIMEOUT)
-        except Exception as exc:
-            log.warning("could not notify peer of consumption: %s", exc)
+        _notify_consumed(peer, manifest["clipboard_id"])
 
         log.info("pasted %d files (%s) from %s into %s",
                  len(written), config.format_size(total_bytes),
                  peer.get("name"), dest)
         return jsonify({
             "from": {"id": peer.get("id"), "name": peer.get("name")},
+            "kind": "files",
             "files_written": [str(p) for p in written],
             "total_bytes": total_bytes,
             "op": manifest.get("op", "copy"),
@@ -354,6 +385,7 @@ def create_app(discovery=None) -> Flask:
 
         manifest = {
             "clipboard_id": clipboard_id,
+            "kind": "files",
             "op": "copy",
             "created_at": time.time(),
             "host_id": config.get_device_id(),

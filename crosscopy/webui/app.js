@@ -21,6 +21,11 @@
     uploadProgress: $("upload-progress"),
     progressBar: $("progress-bar"),
     progressLabel: $("progress-label"),
+    tabFiles: $("tab-files"),
+    tabText: $("tab-text"),
+    textPane: $("text-pane"),
+    textInput: $("text-input"),
+    copyTextBtn: $("copy-text-btn"),
     destInput: $("dest-input"),
     peersList: $("peers-list"),
     addPeerForm: $("add-peer-form"),
@@ -106,6 +111,21 @@
 
   /* ---------- rendering ---------- */
 
+  function isTextManifest(m) {
+    // Manifests without "kind" are file manifests (pre-v0.2 back-compat).
+    return !!m && m.kind === "text";
+  }
+
+  function renderTextClip(manifest, preview) {
+    var wrap = el("div", "text-clip");
+    wrap.appendChild(el("div", "text-block" + (preview ? " preview" : ""), manifest.text || ""));
+    var total = el("div", "file-total");
+    total.appendChild(el("span", null, "text · " + (manifest.text || "").length + " chars"));
+    total.appendChild(el("span", "file-time", relTime(manifest.created_at)));
+    wrap.appendChild(total);
+    return wrap;
+  }
+
   function renderFileList(manifest) {
     var wrap = el("div", "file-list");
     manifest.files.forEach(function (f) {
@@ -130,14 +150,19 @@
 
     var m = status.clipboard;
     els.localClipboard.textContent = "";
-    if (m && m.files && m.files.length) {
+    if (isTextManifest(m)) {
+      els.localClipboard.appendChild(renderTextClip(m, false));
+      els.opBadge.textContent = m.op;
+      els.opBadge.className = "op-badge op-" + m.op;
+      els.clearBtn.classList.remove("hidden");
+    } else if (m && m.files && m.files.length) {
       els.localClipboard.appendChild(renderFileList(m));
       els.opBadge.textContent = m.op;
       els.opBadge.className = "op-badge op-" + m.op;
       els.clearBtn.classList.remove("hidden");
     } else {
       var empty = el("p", "empty-state");
-      empty.innerHTML = 'Clipboard is empty. Use <code>ccp copy &lt;file&gt;</code> or drop files below.';
+      empty.innerHTML = 'Clipboard is empty. Use <code>ccp copy</code>, drop files, or type text below.';
       els.localClipboard.appendChild(empty);
       els.opBadge.className = "op-badge hidden";
       els.clearBtn.classList.add("hidden");
@@ -166,17 +191,19 @@
       head.appendChild(title);
 
       var m = peer.clipboard;
-      if (m && m.files && m.files.length) {
+      var textClip = isTextManifest(m);
+      if (textClip || (m && m.files && m.files.length)) {
         var badge = el("span", "op-badge op-" + m.op, m.op);
         head.appendChild(badge);
         card.appendChild(head);
-        card.appendChild(renderFileList(m));
+        card.appendChild(textClip ? renderTextClip(m, true) : renderFileList(m));
 
         var actions = el("div", "peer-actions");
-        var pasteBtn = el("button", "btn btn-primary", "Paste here");
+        var pasteBtn = el("button", "btn btn-primary",
+          textClip ? "Paste text here" : "Paste here");
         pasteBtn.type = "button";
         pasteBtn.addEventListener("click", function () {
-          doPaste(peer, pasteBtn);
+          doPaste(peer, pasteBtn, textClip);
         });
         actions.appendChild(pasteBtn);
         card.appendChild(actions);
@@ -211,34 +238,96 @@
 
   /* ---------- actions ---------- */
 
-  function doPaste(peer, btn) {
-    var dest = els.destInput.value.trim();
-    if (!dest) {
-      toast("Enter a destination directory first (absolute path).", "error");
-      els.destInput.focus();
-      return;
+  function copyToBrowserClipboard(text) {
+    // Resolves true if the text landed in the browser clipboard, false otherwise.
+    // Never rejects and never hangs (short timeout guard).
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return new Promise(function (resolve) {
+        var timer = setTimeout(function () { resolve(false); }, 1500);
+        navigator.clipboard.writeText(text).then(
+          function () { clearTimeout(timer); resolve(true); },
+          function () { clearTimeout(timer); resolve(false); }
+        );
+      });
     }
-    localStorage.setItem(DEST_KEY, dest);
+    return Promise.resolve(false);
+  }
+
+  function doPaste(peer, btn, textMode) {
+    // Text pastes need no destination directory; file pastes keep requiring one.
+    var body = { peer_id: peer.id };
+    if (!textMode) {
+      var dest = els.destInput.value.trim();
+      if (!dest) {
+        toast("Enter a destination directory first (absolute path).", "error");
+        els.destInput.focus();
+        return;
+      }
+      localStorage.setItem(DEST_KEY, dest);
+      body.dest = dest;
+    }
+    var label = btn.textContent;
     state.busy = true;
     btn.disabled = true;
     btn.textContent = "Pasting…";
     api("/api/paste", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dest: dest, peer_id: peer.id })
+      body: JSON.stringify(body)
     }).then(function (res) {
+      var fromName = (res.from && res.from.name) || peer.name;
+      if (res.kind === "text") {
+        var text = res.text || "";
+        els.textInput.value = text;
+        updateCopyTextBtn();
+        setMode("text");
+        return copyToBrowserClipboard(text).then(function (ok) {
+          toast("Pasted text (" + text.length + " chars) from " + fromName +
+            (ok ? " — copied to browser clipboard" : ""), "success");
+        });
+      }
       var n = (res.files_written || []).length;
       toast("Pasted " + n + " file" + (n === 1 ? "" : "s") +
-        " (" + humanSize(res.total_bytes) + ") from " +
-        ((res.from && res.from.name) || peer.name), "success");
+        " (" + humanSize(res.total_bytes) + ") from " + fromName, "success");
     }).catch(function (err) {
       toast("Paste failed: " + err.message, "error");
     }).then(function () {
       state.busy = false;
       btn.disabled = false;
-      btn.textContent = "Paste here";
+      btn.textContent = label;
       refresh();
     });
+  }
+
+  function updateCopyTextBtn() {
+    els.copyTextBtn.disabled = !els.textInput.value.trim();
+  }
+
+  function setMode(mode) {
+    var textMode = mode === "text";
+    els.tabFiles.classList.toggle("active", !textMode);
+    els.tabText.classList.toggle("active", textMode);
+    els.tabFiles.setAttribute("aria-selected", String(!textMode));
+    els.tabText.setAttribute("aria-selected", String(textMode));
+    els.dropZone.classList.toggle("hidden", textMode);
+    els.textPane.classList.toggle("hidden", !textMode);
+  }
+
+  function doCopyText() {
+    var text = els.textInput.value;
+    if (!text.trim()) return;
+    els.copyTextBtn.disabled = true;
+    api("/api/copy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text, op: "copy" })
+    }).then(function () {
+      toast("Copied text (" + text.length + " chars) to the network clipboard", "success");
+      els.textInput.value = "";
+      refresh();
+    }).catch(function (err) {
+      toast("Copy failed: " + err.message, "error");
+    }).then(updateCopyTextBtn);
   }
 
   function doClear() {
@@ -322,6 +411,11 @@
 
   els.clearBtn.addEventListener("click", doClear);
   els.addPeerForm.addEventListener("submit", doAddPeer);
+
+  els.tabFiles.addEventListener("click", function () { setMode("files"); });
+  els.tabText.addEventListener("click", function () { setMode("text"); });
+  els.textInput.addEventListener("input", updateCopyTextBtn);
+  els.copyTextBtn.addEventListener("click", doCopyText);
 
   els.pickBtn.addEventListener("click", function () { els.fileInput.click(); });
   els.fileInput.addEventListener("change", function () {

@@ -7,8 +7,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/sayeed99/cross-copy/main/install.sh | bash
 #
 # Options:
-#   --service    also install a login service (systemd user unit / launchd agent)
-#                so the cross-copy daemon starts automatically at login.
+#   --no-service   skip setting up daemon autostart. By default the installer
+#                  runs `ccp daemon install` so the daemon starts at login
+#                  (systemd user unit on Linux, launchd agent on macOS).
+#                  Enable it later any time with:  ccp daemon install
+#   --service      accepted for back-compat; autostart is now the default.
 #
 # Environment:
 #   REPO_URL     override the git repo used when not running from a checkout.
@@ -19,16 +22,17 @@ set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/sayeed99/cross-copy.git}"
 
-INSTALL_SERVICE=0
+INSTALL_SERVICE=1
 for arg in "$@"; do
     case "$arg" in
-        --service) INSTALL_SERVICE=1 ;;
+        --no-service) INSTALL_SERVICE=0 ;;
+        --service) ;; # back-compat no-op: autostart is now the default
         -h|--help)
-            sed -n '2,16p' "$0" 2>/dev/null || true
+            sed -n '2,19p' "$0" 2>/dev/null || true
             exit 0
             ;;
         *)
-            echo "Unknown option: $arg (supported: --service)" >&2
+            echo "Unknown option: $arg (supported: --no-service, --service)" >&2
             exit 2
             ;;
     esac
@@ -158,57 +162,21 @@ info "Verifying install ..."
 "$CCP" version || die "'ccp version' failed — the install did not complete correctly."
 
 # ---------------------------------------------------------------------------
-# 7. Optional: install autostart service (--service)
+# 7. Daemon autostart (default; skip with --no-service)
+#    `ccp daemon install` owns the systemd-unit/launchd-plist details.
 # ---------------------------------------------------------------------------
 if [ "$INSTALL_SERVICE" -eq 1 ]; then
-    if [ "$OS" = "Linux" ]; then
-        # ---- systemd user unit (Linux) ----
-        UNIT_DIR="$HOME/.config/systemd/user"
-        UNIT_FILE="$UNIT_DIR/cross-copy.service"
-        info "Installing systemd user service: $UNIT_FILE"
-        mkdir -p "$UNIT_DIR"
-        cat > "$UNIT_FILE" <<EOF
-[Unit]
-Description=cross-copy network clipboard daemon
-
-[Service]
-ExecStart=$CCP daemon run
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-EOF
-        systemctl --user daemon-reload
-        systemctl --user enable --now cross-copy.service
-        info "Service enabled. Check it with: systemctl --user status cross-copy"
+    info "Setting up daemon autostart (ccp daemon install) ..."
+    if "$CCP" daemon install; then
+        info "Daemon autostart enabled — it will start at login and is running now."
     else
-        # ---- launchd agent (macOS) ----
-        PLIST_DIR="$HOME/Library/LaunchAgents"
-        PLIST_FILE="$PLIST_DIR/com.crosscopy.daemon.plist"
-        info "Installing launchd agent: $PLIST_FILE"
-        mkdir -p "$PLIST_DIR"
-        cat > "$PLIST_FILE" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.crosscopy.daemon</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$CCP</string>
-        <string>daemon</string>
-        <string>run</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-EOF
-        launchctl unload "$PLIST_FILE" 2>/dev/null || true
-        launchctl load "$PLIST_FILE"
-        info "Launch agent loaded. The daemon will start at login."
+        warn "Could not set up autostart (e.g. no systemd on this system)."
+        warn "This is not fatal: the daemon still auto-starts on first 'ccp' use."
+        warn "You can retry later with:  ccp daemon install"
     fi
+else
+    info "Skipping autostart setup (--no-service)."
+    info "Enable it later any time with:  ccp daemon install"
 fi
 
 # ---------------------------------------------------------------------------
@@ -220,11 +188,13 @@ cat <<'EOF'
 
 Quickstart:
 
-  ccp copy notes.pdf     # on machine A: put a file on the network clipboard
-  ccp paste              # on machine B: the file appears in the current dir
-  ccp devices            # see other machines on your LAN
-  ccp ui                 # open the web UI (drag & drop files)
+  ccp copy notes.pdf        # on machine A: put a file on the network clipboard
+  ccp copy "meeting at 5"   # ...or put a snippet of text on it
+  ccp paste                 # on machine B: the file appears / the text prints
+  ccp devices               # see other machines on your LAN
+  ccp ui                    # open the web UI (drag & drop files, send text)
 
-The background daemon starts automatically the first time you run a command —
-no setup needed. (Re-run this installer with --service to also start it at login.)
+The daemon now starts at login automatically (unless you used --no-service —
+enable later with 'ccp daemon install'), and it also auto-starts the first
+time you run a ccp command. No further setup needed.
 EOF

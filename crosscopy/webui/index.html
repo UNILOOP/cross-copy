@@ -38,7 +38,12 @@
       </div>
 
       <div id="local-clipboard">
-        <p class="empty-state">Clipboard is empty. Use <code>ccp copy &lt;file&gt;</code> or drop files below.</p>
+        <p class="empty-state">Clipboard is empty. Use <code>ccp copy</code>, drop files, or type text below.</p>
+      </div>
+
+      <div class="mode-tabs" role="tablist" aria-label="Clipboard input mode">
+        <button type="button" id="tab-files" class="mode-tab active" role="tab" aria-selected="true">Files</button>
+        <button type="button" id="tab-text" class="mode-tab" role="tab" aria-selected="false">Text</button>
       </div>
 
       <div id="drop-zone" class="drop-zone" tabindex="0">
@@ -51,6 +56,14 @@
         <div id="upload-progress" class="upload-progress hidden">
           <div class="progress-track"><div id="progress-bar" class="progress-bar"></div></div>
           <span id="progress-label" class="progress-label">Uploading&hellip;</span>
+        </div>
+      </div>
+
+      <div id="text-pane" class="text-pane hidden">
+        <textarea id="text-input" placeholder="Type or paste text to share&hellip;"
+                  rows="4" spellcheck="false"></textarea>
+        <div class="text-pane-actions">
+          <button id="copy-text-btn" class="btn btn-primary" type="button" disabled>Copy text</button>
         </div>
       </div>
     </section>
@@ -85,6 +98,11 @@
     </section>
 
   </main>
+
+  <footer class="app-footer">
+    An open source initiative by
+    <a href="https://uniloop.com" target="_blank" rel="noopener">UNILOOP LLC</a>
+  </footer>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 

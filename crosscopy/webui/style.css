@@ -230,6 +230,86 @@ input:focus {
   font-weight: 550;
 }
 
+/* ---------- text clipboard ---------- */
+
+.mode-tabs {
+  display: inline-flex;
+  gap: 4px;
+  margin-top: 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.mode-tab {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  padding: 4px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.mode-tab.active {
+  background: var(--card-bg);
+  color: var(--accent);
+  box-shadow: var(--shadow);
+}
+
+.text-pane {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.text-pane textarea {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card-bg);
+  color: var(--text);
+  outline: none;
+  resize: vertical;
+  min-height: 88px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.text-pane textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.text-pane-actions { display: flex; justify-content: flex-end; }
+
+.text-block {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.text-block.preview {
+  /* ~6 lines at 13px * 1.5 line-height, plus padding */
+  max-height: 138px;
+  overflow: hidden;
+}
+
 /* ---------- drop zone ---------- */
 
 .drop-zone {
@@ -372,6 +452,25 @@ input:focus {
 .toast.show { opacity: 1; transform: translateY(0); }
 .toast.success { border-left-color: var(--success); }
 .toast.error { border-left-color: var(--error); }
+
+/* ---------- footer ---------- */
+
+.app-footer {
+  max-width: 760px;
+  margin: 24px auto 0;
+  padding: 0 20px 32px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.app-footer a {
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.app-footer a:hover { color: var(--accent); }
 
 /* ---------- responsive ---------- */
 

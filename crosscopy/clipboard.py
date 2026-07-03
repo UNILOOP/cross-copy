@@ -127,10 +127,14 @@ def _file_entry(path: Path, rel_path: str) -> dict:
 
 
 def public_manifest(manifest):
-    """Copy of the manifest with source_path stripped (for serving to peers)."""
+    """Copy of the manifest with source_path stripped (for serving to peers).
+
+    Text manifests are returned verbatim (text included)."""
     if not manifest:
         return None
     pub = dict(manifest)
+    if manifest_kind(manifest) == "text":
+        return pub
     pub["files"] = [
         {k: v for k, v in f.items() if k != "source_path"}
         for f in manifest.get("files", [])
@@ -149,8 +153,12 @@ def load_clipboard():
     try:
         with open(path, "r", encoding="utf-8") as fh:
             manifest = json.load(fh)
-        if isinstance(manifest, dict) and manifest.get("files"):
-            return manifest
+        if isinstance(manifest, dict):
+            if manifest_kind(manifest) == "text":
+                if manifest.get("text"):
+                    return manifest
+            elif manifest.get("files"):
+                return manifest
     except (OSError, ValueError):
         pass
     return None
@@ -199,7 +207,11 @@ def clean_staging(keep=None) -> None:
 # Move semantics: delete sources after a peer has consumed the clipboard
 
 def delete_sources(manifest: dict) -> None:
-    """Delete the manifest's source files, then any now-empty source dirs."""
+    """Delete the manifest's source files, then any now-empty source dirs.
+
+    No-op for text manifests (a consumed text move just clears the clipboard)."""
+    if manifest_kind(manifest) == "text":
+        return
     top_dirs = set()
     for entry in manifest.get("files", []):
         source = entry.get("source_path")
@@ -237,8 +249,16 @@ def delete_sources(manifest: dict) -> None:
 # Convenience
 
 def summarize(manifest) -> str:
-    """Short human summary, e.g. '3 files, 2.1 MB'."""
-    if not manifest or not manifest.get("files"):
+    """Short human summary, e.g. '3 files, 2.1 MB' or 'text (52 chars) "hi…"'."""
+    if not manifest:
+        return "-"
+    if manifest_kind(manifest) == "text":
+        text = manifest.get("text", "")
+        preview = text[:32].replace("\n", " ")
+        if len(text) > 32:
+            preview += "…"
+        return 'text (%d chars) "%s"' % (len(text), preview)
+    if not manifest.get("files"):
         return "-"
     count = len(manifest["files"])
     noun = "file" if count == 1 else "files"

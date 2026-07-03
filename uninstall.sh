@@ -2,9 +2,9 @@
 #
 # cross-copy uninstaller
 #
-# Removes the cross-copy package (pipx install or dedicated venv), the `ccp`
-# symlink, and any login service files. Optionally removes ~/.crosscopy data
-# (asks first; default is to keep it).
+# Removes the daemon autostart service (via `ccp daemon uninstall`), the
+# cross-copy package (pipx install or dedicated venv), and the `ccp` symlink.
+# Optionally removes ~/.crosscopy data (asks first; default is to keep it).
 
 set -euo pipefail
 
@@ -18,34 +18,43 @@ DATA_DIR="${CROSSCOPY_HOME:-$HOME/.crosscopy}"
 REMOVED_SOMETHING=0
 
 # ---------------------------------------------------------------------------
-# 1. Stop and remove login services, if installed
+# 1. Tear down autostart + stop the daemon, while `ccp` still exists.
+#    `ccp daemon uninstall` owns the service teardown (systemd unit / launchd
+#    plist). Fall back to removing leftover service files by hand only if the
+#    `ccp` binary is already gone.
 # ---------------------------------------------------------------------------
-if [ "$OS" = "Linux" ]; then
-    UNIT_FILE="$HOME/.config/systemd/user/cross-copy.service"
-    if [ -f "$UNIT_FILE" ]; then
-        info "Removing systemd user service ..."
-        systemctl --user disable --now cross-copy.service 2>/dev/null || true
-        rm -f "$UNIT_FILE"
-        systemctl --user daemon-reload 2>/dev/null || true
-        REMOVED_SOMETHING=1
-    fi
-elif [ "$OS" = "Darwin" ]; then
-    PLIST_FILE="$HOME/Library/LaunchAgents/com.crosscopy.daemon.plist"
-    if [ -f "$PLIST_FILE" ]; then
-        info "Removing launchd agent ..."
-        launchctl unload "$PLIST_FILE" 2>/dev/null || true
-        rm -f "$PLIST_FILE"
-        REMOVED_SOMETHING=1
-    fi
+CCP_BIN=""
+if command -v ccp >/dev/null 2>&1; then
+    CCP_BIN="$(command -v ccp)"
+elif [ -x "$BIN_LINK" ]; then
+    CCP_BIN="$BIN_LINK"
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Stop a running daemon (best effort)
-# ---------------------------------------------------------------------------
-if command -v ccp >/dev/null 2>&1; then
-    ccp daemon stop >/dev/null 2>&1 || true
-elif [ -x "$BIN_LINK" ]; then
-    "$BIN_LINK" daemon stop >/dev/null 2>&1 || true
+if [ -n "$CCP_BIN" ]; then
+    info "Removing daemon autostart (ccp daemon uninstall) ..."
+    "$CCP_BIN" daemon uninstall >/dev/null 2>&1 || true
+    "$CCP_BIN" daemon stop >/dev/null 2>&1 || true
+else
+    # Best-effort cleanup of service files left behind without `ccp`.
+    if [ "$OS" = "Linux" ]; then
+        UNIT_FILE="$HOME/.config/systemd/user/cross-copy.service"
+        if [ -f "$UNIT_FILE" ]; then
+            info "Removing leftover systemd user service ..."
+            systemctl --user disable --now cross-copy.service 2>/dev/null || true
+            rm -f "$UNIT_FILE"
+            systemctl --user daemon-reload 2>/dev/null || true
+            REMOVED_SOMETHING=1
+        fi
+    elif [ "$OS" = "Darwin" ]; then
+        PLIST_FILE="$HOME/Library/LaunchAgents/com.crosscopy.daemon.plist"
+        if [ -f "$PLIST_FILE" ]; then
+            info "Removing leftover launchd agent ..."
+            launchctl bootout "gui/$(id -u)/com.crosscopy.daemon" 2>/dev/null \
+                || launchctl unload "$PLIST_FILE" 2>/dev/null || true
+            rm -f "$PLIST_FILE"
+            REMOVED_SOMETHING=1
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------
