@@ -22,6 +22,14 @@ BRAND_SOFT = (155, 183, 245, 255)     # lighter companion square
 APP_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium",
                 "chromium-browser", "brave-browser", "brave", "msedge",
                 "microsoft-edge")
+# macOS browsers live in app bundles, not on PATH (fallback when the native
+# NSPanel helper can't run).
+MAC_APP_BROWSERS = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+)
 PANEL_SIZE = (420, 680)               # compact panel app-window, w x h
 
 
@@ -215,6 +223,7 @@ class WidgetApp(object):
         self._popups = {}           # offer_id -> Popen of its popup card
         self._slots = {}            # offer_id -> stacking slot index
         self._my_sends = {}         # offer_id -> peer name (widget-initiated)
+        self._panel_proc = None     # Popen of the native macOS panel
 
     # ----- data ------------------------------------------------------------
 
@@ -333,6 +342,8 @@ class WidgetApp(object):
 
     def open_panel(self):
         url = "http://localhost:%d/widget" % daemon_port()
+        if sys.platform == "darwin" and self._open_mac_panel(url):
+            return
         for name in APP_BROWSERS:
             exe = shutil.which(name)
             if exe:
@@ -344,13 +355,57 @@ class WidgetApp(object):
                     return
                 except OSError:
                     pass
+        # macOS: browser binaries live in app bundles, not on PATH.
+        if sys.platform == "darwin":
+            for bundle_exe in MAC_APP_BROWSERS:
+                if os.path.exists(bundle_exe):
+                    try:
+                        subprocess.Popen(panel_command(bundle_exe, url),
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL,
+                                         start_new_session=True)
+                        return
+                    except OSError:
+                        pass
         webbrowser.open(url)
+
+    def _open_mac_panel(self, url):
+        """Open the native NSPanel (crosscopy.macpanel). Clicking "Open
+        panel" while one is up closes and reopens it (refresh semantics).
+        Returns False when the helper can't run (missing WebKit bindings,
+        exit code 3) so the caller falls back to a browser window."""
+        proc = self._panel_proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "crosscopy.macpanel", url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return False
+        # Give it a moment: a deps-missing exit (code 3) is near-instant.
+        time.sleep(0.6)
+        if proc.poll() is not None:
+            return False
+        self._panel_proc = proc
+        return True
 
     def open_webui(self):
         webbrowser.open("http://localhost:%d/" % daemon_port())
 
     def quit(self):
         self._stop.set()
+        proc = self._panel_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
         if self.icon:
             self.icon.stop()
 

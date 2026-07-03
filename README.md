@@ -186,8 +186,9 @@ ccp widget           # or run it in the foreground once
 Puts cross-copy in your **menu bar (macOS) / system tray (Linux)**: send
 files or your clipboard text to any device in a couple of clicks, and accept
 or decline incoming offers without opening a terminal. **"Open panel"** pops
-a compact panel with the same controls, live-updating. Remove the autostart
-with `ccp widget uninstall`.
+a compact panel with the same controls, live-updating — a **native floating
+window** on macOS (WKWebView), a compact app window on Linux. Remove the
+autostart with `ccp widget uninstall`.
 
 > **Ubuntu/GNOME note:** tray icons render through AppIndicator — the
 > installer builds its venv with `--system-site-packages` so the widget can

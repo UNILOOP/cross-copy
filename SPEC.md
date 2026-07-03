@@ -206,8 +206,11 @@ action buttons and looked bad on Linux:
 - "Open panel" opens `http://localhost:<port>/widget` — a compact liquid-glass panel page
   (`crosscopy/widgetui/{widget.html,widget.js,widget.css}`, served by the daemon at
   `/widget`): peer list with per-peer send (text box + file input), incoming offers with
-  accept/decline, live via SSE. Tries browser app-mode (`--app=` for chrome/chromium/brave,
-  fallback plain tab).
+  accept/decline, live via SSE. macOS: a native floating NSWindow + WKWebView
+  (`crosscopy/macpanel.py`, own subprocess, 420x680 top-right, floating level, no Dock
+  icon; needs `pyobjc-framework-WebKit`, in the widget extra; exit code 3 = missing deps →
+  fall back). Linux/fallback: browser app-mode (`--app=` `--window-size=420,680` for
+  chrome/chromium/brave; macOS bundle paths checked too), last resort plain tab.
 
 ## Liquid glass design (v0.4)
 

@@ -136,10 +136,15 @@ CCP=""
 if command -v pipx >/dev/null 2>&1; then
     info "Installing with pipx ..."
     pipx install --force "$SRC"
-    # Tray-widget extras (pystray/Pillow). Best-effort: the CLI works without.
-    if ! pipx inject cross-copy pystray Pillow >/dev/null 2>&1; then
-        warn "Could not install the tray-widget extras (pystray/Pillow)."
-        warn "The tray icon needs them:  pipx inject cross-copy pystray Pillow"
+    # Tray-widget extras (pystray/Pillow; native panel bindings on macOS).
+    WIDGET_PKGS="pystray Pillow"
+    if [ "$OS" = "Darwin" ]; then
+        WIDGET_PKGS="$WIDGET_PKGS pyobjc-framework-WebKit"
+    fi
+    # shellcheck disable=SC2086
+    if ! pipx inject cross-copy $WIDGET_PKGS >/dev/null 2>&1; then
+        warn "Could not install the tray-widget extras."
+        warn "The tray icon needs them:  pipx inject cross-copy $WIDGET_PKGS"
     fi
     # Prefer the binary pipx just installed (~/.local/bin by default) over
     # `command -v ccp`, which can resolve to a different, pre-existing
