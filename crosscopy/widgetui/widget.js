@@ -15,13 +15,63 @@
     toasts: document.getElementById("toasts")
   };
 
-  var state = { es: null, opened: false, timer: null, watch: {}, sendStatus: {} };
+  var state = { es: null, opened: false, timer: null, watch: {},
+                sendStatus: {}, sendDraft: {} };
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
     if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = text;
     return n;
+  }
+
+  function autoGrow(ta, maxLines) {
+    // Grow a rows=1 textarea with its content, up to maxLines, then scroll.
+    var lines = maxLines || 6;
+    ta.style.height = "auto";
+    var cs = window.getComputedStyle(ta);
+    var line = parseFloat(cs.lineHeight) || 19;
+    var borders = (parseFloat(cs.borderTopWidth) || 0) +
+                  (parseFloat(cs.borderBottomWidth) || 0);
+    var max = Math.ceil(lines * line +
+      (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) +
+      borders);
+    var want = ta.scrollHeight + borders;
+    ta.style.height = Math.min(want, max) + "px";
+    ta.style.overflowY = want > max ? "auto" : "hidden";
+  }
+
+  /* ---------- compact panel window ----------
+     `--app=` windows inherit the browser's last window size, which is often
+     huge/maximized (`--window-size` is ignored when an existing browser
+     process adopts the profile). Best-effort self-correction: resize to a
+     compact panel after load and when content changes. Browsers refuse
+     resizeTo for normal tabs — that's fine, fail silently. Stops as soon as
+     the user resizes the window themselves. */
+  var fit = { timer: null, user: false, w: 0, h: 0 };
+
+  window.addEventListener("resize", function () {
+    if (fit.w &&
+        (Math.abs(window.outerWidth - fit.w) > 4 ||
+         Math.abs(window.outerHeight - fit.h) > 4)) {
+      fit.user = true; // not a size we set — user took over
+    }
+  });
+
+  function fitPanelWindow() {
+    if (fit.user || fit.timer) return;
+    fit.timer = setTimeout(function () {
+      fit.timer = null;
+      if (fit.user) return;
+      try {
+        var chromeH = Math.max(0, (window.outerHeight || 0) - (window.innerHeight || 0));
+        var content = document.documentElement.scrollHeight + chromeH;
+        var h = Math.min(Math.max(content, 420), 760);
+        fit.w = 420;
+        fit.h = h;
+        window.resizeTo(420, h);
+      } catch (e) { /* not allowed for this window — fine */ }
+    }, 350);
   }
 
   function toast(msg, kind) {
@@ -160,6 +210,17 @@
   /* ---------- peers ---------- */
 
   function renderPeers(peers) {
+    // Preserve focus + caret of a send box across re-renders (SSE bursts
+    // used to wipe half-typed text; drafts live in state.sendDraft).
+    var focusPeer = null, selStart = 0, selEnd = 0;
+    var active = document.activeElement;
+    if (active && active.classList && active.classList.contains("send-input") &&
+        els.peers.contains(active)) {
+      focusPeer = active.dataset.peer;
+      selStart = active.selectionStart;
+      selEnd = active.selectionEnd;
+    }
+
     els.peers.textContent = "";
     if (!peers.length) {
       els.peers.appendChild(el("p", "empty", "No devices found on the network."));
@@ -179,9 +240,19 @@
       row.appendChild(head);
 
       var send = el("div", "peer-send");
-      var input = el("input");
-      input.type = "text";
+      // A textarea (not <input>) so multi-line text stays visible and
+      // scrollable: grows with content up to ~6 lines, then scrolls.
+      var input = el("textarea", "send-input");
+      input.rows = 1;
       input.placeholder = "Send text…";
+      input.title = "Enter sends · Shift+Enter adds a line";
+      input.spellcheck = false;
+      input.dataset.peer = peer.id;
+      input.value = state.sendDraft[peer.id] || "";
+      input.addEventListener("input", function () {
+        state.sendDraft[peer.id] = input.value;
+        autoGrow(input);
+      });
       var sendBtn = el("button", "btn btn-primary", "Send");
       sendBtn.addEventListener("click", function () {
         var text = input.value;
@@ -191,10 +262,18 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ peer_id: peer.id, text: text })
-        }, function () { sendBtn.disabled = false; input.value = ""; });
+        }, function () {
+          sendBtn.disabled = false;
+          input.value = "";
+          delete state.sendDraft[peer.id];
+          autoGrow(input);
+        });
       });
       input.addEventListener("keydown", function (e) {
-        if (e.key === "Enter") sendBtn.click();
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendBtn.click();
+        }
       });
 
       var fileBtn = el("label", "btn file-btn", "📁");
@@ -220,6 +299,20 @@
       row.appendChild(send);
       els.peers.appendChild(row);
     });
+
+    // Size restored drafts now that the textareas are in the DOM.
+    var tas = els.peers.querySelectorAll("textarea.send-input");
+    for (var i = 0; i < tas.length; i++) autoGrow(tas[i]);
+
+    if (focusPeer) {
+      for (var j = 0; j < tas.length; j++) {
+        if (tas[j].dataset.peer === focusPeer) {
+          tas[j].focus();
+          try { tas[j].setSelectionRange(selStart, selEnd); } catch (e) { /* ok */ }
+          break;
+        }
+      }
+    }
   }
 
   /* ---------- refresh: SSE + slow fallback poll ---------- */
@@ -233,6 +326,7 @@
       els.name.textContent = r[0].name || "cross-copy";
       renderPeers(r[1].peers || []);
       renderOffers(r[2].offers || []);
+      fitPanelWindow(); // content changed — keep the app window compact
       if (!state.es) connectEvents();
     }).catch(function () {
       setLive(false);
@@ -279,4 +373,5 @@
   refresh();
   connectEvents();
   setInterval(refresh, POLL_MS);
+  fitPanelWindow();
 })();

@@ -8,7 +8,7 @@
   --muted: rgba(22, 32, 58, 0.68);
   --glass: rgba(255, 255, 255, 0.52);
   --glass-strong: rgba(255, 255, 255, 0.68);
-  --glass-input: rgba(255, 255, 255, 0.5);
+  --glass-input: rgba(255, 255, 255, 0.74);
   --hairline: rgba(255, 255, 255, 0.65);
   --hairline-soft: rgba(22, 32, 58, 0.1);
   --shadow: 0 12px 32px rgba(24, 39, 75, 0.16), 0 2px 8px rgba(24, 39, 75, 0.08);
@@ -34,7 +34,7 @@
     --muted: rgba(237, 241, 250, 0.66);
     --glass: rgba(28, 32, 46, 0.55);
     --glass-strong: rgba(34, 39, 56, 0.68);
-    --glass-input: rgba(0, 0, 0, 0.28);
+    --glass-input: rgba(0, 0, 0, 0.4);
     --hairline: rgba(255, 255, 255, 0.14);
     --hairline-soft: rgba(255, 255, 255, 0.1);
     --shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.3);
@@ -251,11 +251,12 @@ code {
 
 .btn-danger { color: var(--bad); }
 
-input[type="text"], input[type="number"] {
+input[type="text"], input[type="number"], textarea {
   font-family: inherit;
   font-size: 14px;
+  line-height: 1.45;
   padding: 7px 10px;
-  border: 1px solid var(--hairline);
+  border: 1px solid var(--hairline-soft);
   border-radius: var(--radius-sm);
   background: var(--glass-input);
   color: var(--text);
@@ -265,7 +266,7 @@ input[type="text"], input[type="number"] {
 
 input::placeholder, textarea::placeholder { color: var(--muted); }
 
-input:focus {
+input:focus, textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
@@ -376,14 +377,10 @@ input:focus {
   font-size: 13px;
   line-height: 1.5;
   padding: 9px 11px;
-  border: 1px solid var(--hairline);
-  border-radius: var(--radius-sm);
-  background: var(--glass-input);
-  color: var(--text);
-  outline: none;
   resize: vertical;
   min-height: 88px;
-  transition: border-color 0.18s, box-shadow 0.18s;
+  max-height: 60vh;
+  overflow-y: auto;
 }
 
 .text-pane textarea:focus {
@@ -408,9 +405,9 @@ input:focus {
 }
 
 .text-block.preview {
-  /* ~6 lines at 13px * 1.5 line-height, plus padding */
+  /* ~6 lines at 13px * 1.5 line-height, plus padding; scrolls past that */
   max-height: 138px;
-  overflow: hidden;
+  overflow-y: auto;
 }
 
 /* ---------- drop zone ---------- */
@@ -596,8 +593,17 @@ input:focus {
 .send-status.ok { color: var(--ok); font-weight: 600; }
 .send-status.bad { color: var(--bad); font-weight: 600; }
 
-.send-row { display: flex; gap: 8px; }
-.send-row .send-input { flex: 1; min-width: 0; font-size: 13px; }
+.send-row { display: flex; gap: 8px; align-items: flex-start; }
+.send-row .send-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  /* rows=1 textarea that auto-grows with content (JS), up to ~6 lines */
+  resize: none;
+  min-height: 35px;
+  max-height: calc(6 * 1.45em + 16px);
+  overflow-y: auto;
+}
 
 .send-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
 

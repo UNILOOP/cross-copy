@@ -96,6 +96,22 @@
     return node;
   }
 
+  function autoGrow(ta, maxLines) {
+    // Grow a rows=1 textarea with its content, up to maxLines, then scroll.
+    var lines = maxLines || 6;
+    ta.style.height = "auto";
+    var cs = window.getComputedStyle(ta);
+    var line = parseFloat(cs.lineHeight) || 20;
+    var borders = (parseFloat(cs.borderTopWidth) || 0) +
+                  (parseFloat(cs.borderBottomWidth) || 0);
+    var max = Math.ceil(lines * line +
+      (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0) +
+      borders);
+    var want = ta.scrollHeight + borders;
+    ta.style.height = Math.min(want, max) + "px";
+    ta.style.overflowY = want > max ? "auto" : "hidden";
+  }
+
   function toast(message, kind) {
     var t = el("div", "toast " + (kind || "info"), message);
     els.toasts.appendChild(t);
@@ -375,6 +391,7 @@
       setSendStatus(peer.id, "waiting for accept…");
       delete state.sendDraft[peer.id];
       input.value = "";
+      autoGrow(input);
       if (offer.offer_id) watchSend(offer.offer_id, peer.id);
     }).catch(function (err) {
       setSendStatus(peer.id, "failed", "bad");
@@ -401,14 +418,18 @@
     block.appendChild(labelRow);
 
     var row = el("div", "send-row");
-    var input = el("input", "send-input");
-    input.type = "text";
+    // A textarea (not <input>) so pasted/typed multi-line text stays usable:
+    // starts one line tall, grows with content up to ~6 lines, then scrolls.
+    var input = el("textarea", "send-input");
+    input.rows = 1;
     input.placeholder = "Text to send to " + (peer.name || "this device") + "…";
+    input.title = "Enter sends · Shift+Enter adds a line";
     input.spellcheck = false;
     input.dataset.peer = peer.id;
     input.value = state.sendDraft[peer.id] || "";
     input.addEventListener("input", function () {
       state.sendDraft[peer.id] = input.value;
+      autoGrow(input);
     });
     var sendBtn = el("button", "btn btn-primary", "Send");
     sendBtn.type = "button";
@@ -416,7 +437,10 @@
       doSendText(peer, input, sendBtn);
     });
     input.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") sendBtn.click();
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendBtn.click();
+      }
     });
     row.appendChild(input);
     row.appendChild(sendBtn);
@@ -494,6 +518,10 @@
       card.appendChild(buildSendBlock(peer));
       els.peersList.appendChild(card);
     });
+
+    // Size restored drafts now that the textareas are in the DOM.
+    var tas = els.peersList.querySelectorAll("textarea.send-input");
+    for (var t = 0; t < tas.length; t++) autoGrow(tas[t]);
 
     if (focusPeer) {
       var inputs = els.peersList.querySelectorAll(".send-input");

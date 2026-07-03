@@ -771,7 +771,154 @@ def cmd_decline(args):
           % (offer_contents(offer), offer_from_name(offer)))
 
 
+WIDGET_LAUNCHD_LABEL = "com.crosscopy.widget"
+
+
+def widget_autostart_desktop_path():
+    return os.path.expanduser("~/.config/autostart/cross-copy-widget.desktop")
+
+
+def widget_launchd_plist_path():
+    return os.path.expanduser("~/Library/LaunchAgents/%s.plist"
+                              % WIDGET_LAUNCHD_LABEL)
+
+
+def stop_running_widget():
+    """Best-effort SIGTERM of a running widget via its pidfile."""
+    path = os.path.join(crosscopy_home(), "widget.json")
+    try:
+        with open(path) as f:
+            pid = int(json.load(f)["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    if pid_alive(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def spawn_widget():
+    """Start the tray widget detached; output appended to widget.log."""
+    home = crosscopy_home()
+    os.makedirs(home, exist_ok=True)
+    log = open(os.path.join(home, "widget.log"), "ab")
+    try:
+        subprocess.Popen(
+            [sys.executable, "-m", "crosscopy.widget"],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            cwd=os.path.expanduser("~"),
+        )
+    finally:
+        log.close()
+
+
+def cmd_widget_install():
+    ensure_daemon()
+    if sys.platform == "darwin":
+        launcher = make_macos_launcher()
+        plist = {
+            "Label": WIDGET_LAUNCHD_LABEL,
+            "ProgramArguments": [launcher, "-m", "crosscopy.widget"],
+            "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False},
+            "StandardOutPath": os.path.join(crosscopy_home(), "widget.log"),
+            "StandardErrorPath": os.path.join(crosscopy_home(), "widget.log"),
+        }
+        plist_path = widget_launchd_plist_path()
+        os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+        with open(plist_path, "wb") as f:
+            plistlib.dump(plist, f)
+        uid = os.getuid()
+        run_launchctl(["bootout", "gui/%d/%s" % (uid, WIDGET_LAUNCHD_LABEL)])
+        code, errs = run_launchctl(["bootstrap", "gui/%d" % uid, plist_path])
+        if code != 0:
+            code, errs2 = run_launchctl(["load", "-w", plist_path])
+            if code != 0:
+                die("Could not load the widget launch agent.\n"
+                    "   bootstrap: %s\n   load -w: %s" % (errs, errs2))
+        print("✅ Tray widget will start at login (%s)." % plist_path)
+    elif sys.platform.startswith("linux"):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            die("No graphical session detected (DISPLAY/WAYLAND_DISPLAY unset). "
+                "Run this from your desktop session.")
+        desktop_path = widget_autostart_desktop_path()
+        os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+        with open(desktop_path, "w") as f:
+            f.write(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Cross Copy\n"
+                "Comment=cross-copy tray widget\n"
+                "Exec=%s -m crosscopy.widget\n"
+                "Terminal=false\n"
+                "X-GNOME-Autostart-enabled=true\n" % sys.executable)
+        stop_running_widget()
+        spawn_widget()
+        time.sleep(2.0)
+        pidfile = os.path.join(crosscopy_home(), "widget.json")
+        if os.path.exists(pidfile):
+            print("✅ Tray widget running now and will start at login (%s)."
+                  % desktop_path)
+        else:
+            log_path = os.path.join(crosscopy_home(), "widget.log")
+            tail = ""
+            try:
+                with open(log_path) as f:
+                    tail = "".join(f.readlines()[-4:])
+            except OSError:
+                pass
+            die("The tray widget did not stay running. Recent log:\n%s\n"
+                "   Log file: %s" % (tail.rstrip(), log_path))
+    else:
+        die("The tray widget is only supported on macOS and Linux.")
+
+
+def cmd_widget_uninstall():
+    removed = False
+    if sys.platform == "darwin":
+        plist_path = widget_launchd_plist_path()
+        if os.path.exists(plist_path):
+            uid = os.getuid()
+            code, _ = run_launchctl(["bootout",
+                                     "gui/%d/%s" % (uid, WIDGET_LAUNCHD_LABEL)])
+            if code != 0:
+                run_launchctl(["unload", plist_path])
+            try:
+                os.remove(plist_path)
+                removed = True
+            except OSError as e:
+                die("Could not remove %s: %s" % (plist_path, e))
+    elif sys.platform.startswith("linux"):
+        desktop_path = widget_autostart_desktop_path()
+        if os.path.exists(desktop_path):
+            try:
+                os.remove(desktop_path)
+                removed = True
+            except OSError as e:
+                die("Could not remove %s: %s" % (desktop_path, e))
+    stop_running_widget()
+    if removed:
+        print("✅ Tray widget autostart removed.")
+    else:
+        print("No tray widget autostart was installed; nothing to remove.")
+
+
 def cmd_widget(args):
+    action = getattr(args, "action", None) or "run"
+    if action == "install":
+        cmd_widget_install()
+        return
+    if action == "uninstall":
+        cmd_widget_uninstall()
+        return
     ensure_daemon()
     try:
         from crosscopy import widget
@@ -1458,8 +1605,12 @@ def build_parser():
 
     p = sub.add_parser(
         "widget",
-        help='run the menu-bar/tray widget (needs: pip install '
-             '"cross-copy[widget]")')
+        help='run the menu-bar/tray widget; "widget install" starts it at '
+             'login (needs: pip install "cross-copy[widget]")')
+    p.add_argument("action", nargs="?", default="run",
+                   choices=["run", "install", "uninstall"],
+                   help="run: foreground (default); install/uninstall: "
+                        "start-at-login autostart")
     p.set_defaults(func=cmd_widget)
 
     p = sub.add_parser("update",

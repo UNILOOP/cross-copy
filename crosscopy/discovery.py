@@ -36,6 +36,7 @@ log = logging.getLogger("crosscopy.discovery")
 
 SERVICE_TYPE = "_crosscopy._tcp.local."
 PING_TIMEOUT = 2.0
+PROBE_TIMEOUT = 1.5        # per-candidate reachability probe (host selection)
 HELLO_TIMEOUT = 2.0
 HELLO_INTERVAL = 60.0      # periodic hello round
 HELLO_EXPIRY = 10 * 60.0   # hello-sourced peers expire after 10 min
@@ -91,6 +92,66 @@ def get_local_ips() -> list:
     return sorted(ips) or [primary]
 
 
+# ---------------------------------------------------------------------------
+# Peer host selection
+#
+# Multi-homed peers advertise ALL their IPv4s over mDNS (docker bridges,
+# tailscale CGNAT, the real LAN IP, ...). Blindly taking addresses[0] can
+# pick e.g. 172.17.0.1 and every transfer then times out. Instead we keep
+# every candidate on the peer record ("addresses") and choose "host" by:
+#   (a) an address confirmed by actual contact (hello source IP / last
+#       successful outbound request) always wins and is never clobbered by
+#       an unprobed mDNS refresh;
+#   (b) otherwise probe candidates concurrently (GET /api/ping) and take a
+#       reachable one, preferring RFC1918 LAN ranges over CGNAT 100.64/10;
+#   (c) otherwise fall back to the first address.
+# The choice is cached; we only re-select when contact fails (the server's
+# retry path calls confirm_contact() with whatever address actually worked).
+
+def _addr_pref(addr: str) -> int:
+    """Preference rank for a candidate address: RFC1918 LAN ranges (0) over
+    anything else (1) over CGNAT 100.64/10 (2, e.g. tailscale)."""
+    parts = addr.split(".")
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        return 1
+    if a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31):
+        return 0
+    if a == 100 and 64 <= b <= 127:
+        return 2
+    return 1
+
+
+def _ping_addr(addr: str, port: int) -> bool:
+    """One reachability probe: GET /api/ping with a short timeout."""
+    try:
+        resp = requests.get("http://%s:%d/api/ping" % (addr, int(port)),
+                            timeout=PROBE_TIMEOUT)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def select_host(addresses: list, port: int, prober=None) -> str:
+    """Pick the best host among candidate addresses: probe all concurrently
+    and take a reachable one (preferring LAN-looking addresses, see
+    _addr_pref); when nothing answers, fall back to the first address.
+    `prober(addr, port) -> bool` is injectable for tests."""
+    addresses = [a for a in addresses if a]
+    if not addresses:
+        return ""
+    if len(addresses) == 1:
+        return addresses[0]
+    prober = prober or _ping_addr
+    with ThreadPoolExecutor(max_workers=min(8, len(addresses))) as pool:
+        alive = list(pool.map(lambda a: prober(a, port), addresses))
+    reachable = [a for a, ok in zip(addresses, alive) if ok]
+    if reachable:
+        return min(reachable, key=lambda a: (_addr_pref(a), addresses.index(a)))
+    return addresses[0]
+
+
 class Discovery:
     """Zeroconf registration/browsing, hello sender loop, and the unified
     id-keyed peer registry.
@@ -110,6 +171,7 @@ class Discovery:
         self._stop = threading.Event()
         self._hello_wake = threading.Event()
         self._hello_thread = None
+        self._prober = None        # test hook: prober(addr, port) -> bool
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -243,6 +305,7 @@ class Discovery:
             platform=props.get("platform", "unknown"),
             version=props.get("version", "unknown"),
             source="mdns",
+            addresses=addresses,
         )
         if is_new or not known:
             log.info("mDNS: peer seen: %s (%s:%s)",
@@ -254,38 +317,114 @@ class Discovery:
     # -- unified registry ----------------------------------------------------
 
     def record_peer(self, peer_id, name, host, port, platform, version,
-                    source) -> bool:
+                    source, addresses=None) -> bool:
         """Merge a sighting into the id-keyed registry (freshest wins; the
-        "source" shown is the most recent sighting's). Publishes a "peers"
+        "source" shown is the most recent sighting's). All candidate
+        addresses ever seen for the peer are kept on the record
+        ("addresses"); "host" is the selected one (see select_host above).
+        A hello/manual sighting's host is contact-confirmed ground truth; an
+        mDNS refresh never overwrites a confirmed host, and an already-cached
+        unconfirmed choice is kept rather than re-probed. Publishes a "peers"
         event when the sighting adds a peer or changes something meaningful —
         not on plain last_seen refreshes. Returns True if the peer was new."""
         if not peer_id or peer_id == config.get_device_id():
             return False
+        port = int(port)
+        with self._lock:
+            old = self._peers.get(peer_id)
+            old = dict(old) if old is not None else None
+        cand = []
+        for addr in list(addresses or []) + [host] \
+                + list((old or {}).get("addresses") or []):
+            if addr and addr not in cand:
+                cand.append(addr)
+
+        # Host selection. hello = the request's source IP; manual = an
+        # address we just successfully pinged: both are confirmed by actual
+        # contact and win outright.
+        confirmed = source in ("hello", "manual")
+        if confirmed:
+            chosen = host
+        elif old and old.get("host_confirmed") and old.get("host"):
+            chosen = old["host"]      # never clobber a confirmed host
+            confirmed = True
+        elif old and old.get("host") in cand:
+            chosen = old["host"]      # cached choice; re-probe on failure only
+        elif len(cand) > 1:
+            chosen = select_host(cand, port, prober=self._prober)
+        else:
+            chosen = cand[0] if cand else host
+
         record = {
             "id": peer_id,
             "name": name or peer_id,
-            "host": host,
-            "port": int(port),
+            "host": chosen,
+            "port": port,
             "platform": platform or "unknown",
             "version": version or "unknown",
             "last_seen": time.time(),
             "source": source,
+            "addresses": cand,
+            "host_confirmed": confirmed,
         }
         with self._lock:
-            old = self._peers.get(peer_id)
+            # select_host may have probed for a while; if a confirmed
+            # sighting (hello) landed meanwhile, keep its host.
+            current = self._peers.get(peer_id)
+            if (current is not None and current.get("host_confirmed")
+                    and not confirmed and current.get("host")):
+                record["host"] = current["host"]
+                record["host_confirmed"] = True
+                for addr in current.get("addresses") or []:
+                    if addr not in record["addresses"]:
+                        record["addresses"].append(addr)
             self._peers[peer_id] = record
         is_new = old is None
         # "source" flips (mdns <-> hello sightings alternate) are not
         # meaningful changes; everything else is.
         changed = is_new or any(
             old.get(key) != record[key]
-            for key in ("name", "host", "port", "platform", "version"))
+            for key in ("name", "host", "port", "platform", "version")
+        ) or set(old.get("addresses") or []) != set(record["addresses"])
         if changed:
             if is_new:
-                log.info("peer added: %s (%s:%s) via %s",
-                         record["name"], host, port, source)
+                log.info("peer added: %s (%s:%s) via %s [candidates: %s]",
+                         record["name"], record["host"], port, source,
+                         ", ".join(cand))
             bus.publish("peers")
         return is_new
+
+    def confirm_contact(self, peer_id, host) -> None:
+        """A real request exchange with `host` just succeeded: make it the
+        peer's selected host and mark it contact-confirmed so mDNS refreshes
+        won't clobber it. Called by the server after any successful outbound
+        peer request (including the retry path that found a working
+        alternate address)."""
+        if not peer_id or not host:
+            return
+        with self._lock:
+            record = self._peers.get(peer_id)
+            if record is None:
+                return
+            addrs = record.setdefault("addresses", [])
+            if host not in addrs:
+                addrs.insert(0, host)
+            changed = (record.get("host") != host
+                       or not record.get("host_confirmed"))
+            record["host"] = host
+            record["host_confirmed"] = True
+            record["last_seen"] = time.time()
+        if changed:
+            log.info("peer %s host confirmed by contact: %s", peer_id, host)
+            bus.publish("peers")
+
+    def inject_record_for_tests(self, record: dict) -> None:
+        """TEST ONLY: overwrite a raw registry record, bypassing selection
+        and probing. Used by the network test harness (via the
+        CROSSCOPY_TEST_HOOKS server endpoint) to simulate a peer whose mDNS
+        sighting picked an unroutable address."""
+        with self._lock:
+            self._peers[record["id"]] = dict(record)
 
     def _manual_hostports(self) -> set:
         return set((p["host"], int(p["port"])) for p in config.get_manual_peers())
@@ -329,7 +468,8 @@ class Discovery:
             self._probe_manual(entry["host"], entry["port"])
 
         with self._lock:
-            peers = [dict(r) for r in self._peers.values() if r["id"] != my_id]
+            peers = [dict(r, addresses=list(r.get("addresses") or []))
+                     for r in self._peers.values() if r["id"] != my_id]
         return sorted(peers, key=lambda p: p.get("name", ""))
 
     def _probe_manual(self, host: str, port: int):
@@ -421,3 +561,6 @@ class Discovery:
             version=data.get("version", "unknown"),
             source=source,
         )
+        # The POST above actually reached `host` — that's confirmed contact
+        # (record_peer keeps a previously-confirmed host, which may differ).
+        self.confirm_contact(peer_id, host)

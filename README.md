@@ -131,7 +131,8 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 | `ccp daemon install` | Set up start-at-login (systemd user unit / launchd agent) and start the daemon now. `install.sh` runs this by default (`--no-service` to opt out) |
 | `ccp daemon uninstall` | Stop, disable, and remove the start-at-login service |
 | `ccp ui` | Open the web UI in your browser |
-| `ccp widget` | Run the menu-bar / system-tray companion (needs the optional `[widget]` extra — see below) |
+| `ccp widget` | Run the menu-bar / system-tray companion in the foreground (see below) |
+| `ccp widget install\|uninstall` | Start the tray widget now **and at every login** / remove that. `install.sh` runs `install` by default in graphical sessions |
 | `ccp update` | Update cross-copy to the latest version (and restart the daemon) |
 | `ccp update --check` | Only check whether a newer version is available |
 | `ccp version` | Print the version |
@@ -178,21 +179,30 @@ sharing? Hit **"Stop sharing"**.
 ### Tray widget
 
 ```sh
-ccp widget
+ccp widget install   # start now + at every login (install.sh does this by default)
+ccp widget           # or run it in the foreground once
 ```
 
 Puts cross-copy in your **menu bar (macOS) / system tray (Linux)**: send
 files or your clipboard text to any device in a couple of clicks, and accept
 or decline incoming offers without opening a terminal. **"Open panel"** pops
-a compact panel with the same controls, live-updating.
+a compact panel with the same controls, live-updating. Remove the autostart
+with `ccp widget uninstall`.
 
-The widget needs two optional dependencies (`pystray` and `Pillow`), packaged
-as the `widget` extra:
+> **Ubuntu/GNOME note:** tray icons render through AppIndicator — the
+> installer builds its venv with `--system-site-packages` so the widget can
+> use the system's PyGObject. If the icon doesn't appear, check that the
+> "Ubuntu AppIndicators" GNOME extension is enabled and
+> `gir1.2-ayatanaappindicator3-0.1` is installed.
+
+The widget needs two optional dependencies (`pystray` and `Pillow`) —
+`install.sh` includes them by default; for manual installs they're the
+`widget` extra:
 
 ```sh
 pip install "cross-copy[widget]"
 # pipx users:
-pipx install "cross-copy[widget]" --force
+pipx install cross-copy && pipx inject cross-copy pystray Pillow
 ```
 
 Desktop notifications don't need the extra: on macOS and Linux the daemon

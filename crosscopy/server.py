@@ -39,6 +39,7 @@ PING_TIMEOUT = 2.0        # seconds, for live peer meta/ping fetches
 CONSUMED_TIMEOUT = 5.0
 OFFER_TIMEOUT = 5.0       # cross-peer offer push
 TRANSFER_TIMEOUT = (5.0, 300.0)  # (connect, read) for file downloads
+RETRY_CONNECT_TIMEOUT = 3.0      # connect timeout for alternate-address retries
 CHUNK_SIZE = 64 * 1024
 SSE_HEARTBEAT = 15.0      # seconds between ": ping" comments on /api/events
 
@@ -55,15 +56,101 @@ def _device_info() -> dict:
     }
 
 
-def _peer_url(peer: dict, path: str) -> str:
-    return "http://%s:%d%s" % (peer["host"], int(peer["port"]), path)
+class PeerUnreachable(Exception):
+    """A peer answered on none of its known candidate addresses. str() is
+    the human-facing message ("could not reach <name> (tried ... on port
+    N)") — safe to return in API error bodies."""
+
+    def __init__(self, peer: dict, tried: list):
+        self.peer = peer
+        self.tried = list(tried)
+        self.port = int(peer.get("port") or config.DEFAULT_PORT)
+        super().__init__("could not reach %s (tried %s on port %d)" % (
+            peer.get("name") or peer.get("host") or "peer",
+            ", ".join(self.tried) or "no addresses", self.port))
 
 
-def _fetch_peer_clipboard(peer: dict):
+def _friendly_error(exc) -> str:
+    """Short human reason for a failed peer request. Raw requests exception
+    text (HTTPConnectionPool(...) etc.) must never reach API clients."""
+    if isinstance(exc, PeerUnreachable):
+        return str(exc)
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "connection failed"           # includes connect timeouts
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "peer timed out"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            return "peer answered HTTP %d" % resp.status_code
+        return "peer answered with an error"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return "request failed"
+    return str(exc)
+
+
+def _peer_hosts(peer: dict) -> list:
+    """Candidate addresses to try: selected host first, then the rest."""
+    hosts = [peer.get("host")]
+    for addr in peer.get("addresses") or []:
+        if addr not in hosts:
+            hosts.append(addr)
+    return [h for h in hosts if h]
+
+
+def _confirm_peer_host(peer: dict, host: str, discovery) -> None:
+    """`host` just answered a real request: use it for the rest of this
+    handler and pin it on the discovery record for future calls."""
+    peer["host"] = host
+    if discovery is not None:
+        try:
+            discovery.confirm_contact(peer.get("id"), host)
+        except Exception:
+            pass
+
+
+def _retry_timeout(timeout):
+    """Same read timeout, short connect timeout, for alternate-address tries."""
+    if isinstance(timeout, tuple):
+        return (RETRY_CONNECT_TIMEOUT, timeout[1])
+    return RETRY_CONNECT_TIMEOUT
+
+
+def _peer_request(peer: dict, method: str, path: str, discovery=None,
+                  timeout=PING_TIMEOUT, **kwargs):
+    """requests.request() against a peer with multi-address resilience: on a
+    connect error/timeout, retry the peer's other candidate addresses (short
+    connect timeout); whichever address answers becomes the peer's host (see
+    _confirm_peer_host). Raises PeerUnreachable when every candidate fails;
+    HTTP-level errors pass through untouched."""
+    port = int(peer.get("port") or config.DEFAULT_PORT)
+    tried = []
+    for host in _peer_hosts(peer):
+        url = "http://%s:%d%s" % (host, port, path)
+        try:
+            resp = requests.request(
+                method, url,
+                timeout=timeout if not tried else _retry_timeout(timeout),
+                **kwargs)
+        except requests.exceptions.ConnectionError as exc:
+            tried.append(host)
+            log.debug("peer %s unreachable at %s:%d (%s); %s",
+                      peer.get("name"), host, port, exc.__class__.__name__,
+                      "trying alternates" if len(tried) == 1 else "next")
+            continue
+        if tried:
+            log.info("peer %s reached at alternate address %s (host was %s)",
+                     peer.get("name"), host, tried[0])
+        _confirm_peer_host(peer, host, discovery)
+        return resp
+    raise PeerUnreachable(peer, tried)
+
+
+def _fetch_peer_clipboard(peer: dict, discovery=None):
     """Live-fetch a peer's public manifest; None if empty/unreachable."""
     try:
-        resp = requests.get(_peer_url(peer, "/api/clipboard/meta"),
-                            timeout=PING_TIMEOUT)
+        resp = _peer_request(peer, "GET", "/api/clipboard/meta",
+                             discovery=discovery, timeout=PING_TIMEOUT)
         if resp.status_code == 200:
             manifest = resp.json()
             if isinstance(manifest, dict):
@@ -77,12 +164,13 @@ def _fetch_peer_clipboard(peer: dict):
     return None
 
 
-def _attach_clipboards(peers: list) -> None:
+def _attach_clipboards(peers: list, discovery=None) -> None:
     """Fill in peer["clipboard"] for every peer, concurrently."""
     if not peers:
         return
     with ThreadPoolExecutor(max_workers=min(8, len(peers))) as pool:
-        clipboards = list(pool.map(_fetch_peer_clipboard, peers))
+        clipboards = list(pool.map(
+            lambda p: _fetch_peer_clipboard(p, discovery), peers))
     for peer, manifest in zip(peers, clipboards):
         peer["clipboard"] = manifest
 
@@ -91,14 +179,16 @@ def _error(message: str, status: int):
     return jsonify({"error": message}), status
 
 
-def _notify_consumed(peer: dict, clipboard_id: str) -> None:
+def _notify_consumed(peer: dict, clipboard_id: str, discovery=None) -> None:
     """Tell the source we're done (triggers source cleanup for op=move)."""
     try:
-        requests.post(_peer_url(peer, "/api/clipboard/consumed"),
+        _peer_request(peer, "POST", "/api/clipboard/consumed",
+                      discovery=discovery,
                       json={"clipboard_id": clipboard_id},
                       timeout=CONSUMED_TIMEOUT)
     except Exception as exc:
-        log.warning("could not notify peer of consumption: %s", exc)
+        log.warning("could not notify peer of consumption: %s",
+                    _friendly_error(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +459,7 @@ def create_app(discovery=None, updater=None) -> Flask:
     def api_peers():
         peers = _get_peers()
         if request.args.get("with_clipboard") == "1":
-            _attach_clipboards(peers)
+            _attach_clipboards(peers, discovery)
         return jsonify({"peers": peers})
 
     @app.post("/api/peers/add")
@@ -388,7 +478,8 @@ def create_app(discovery=None, updater=None) -> Flask:
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            return _error("peer unreachable at %s:%d (%s)" % (host, port, exc), 502)
+            return _error("peer unreachable at %s:%d (%s)"
+                          % (host, port, _friendly_error(exc)), 502)
         config.add_manual_peer(host, port)
         return jsonify({
             "id": data.get("id"),
@@ -440,7 +531,7 @@ def create_app(discovery=None, updater=None) -> Flask:
             if not peers:
                 return _error("peer not found: %s" % peer_id, 404)
 
-        _attach_clipboards(peers)
+        _attach_clipboards(peers, discovery)
         candidates = [p for p in peers if p.get("clipboard")]
         if want_clipboard_id:
             candidates = [p for p in candidates
@@ -454,7 +545,7 @@ def create_app(discovery=None, updater=None) -> Flask:
 
         # Text clipboards: nothing to download, dest is ignored.
         if clipboard.manifest_kind(manifest) == "text":
-            _notify_consumed(peer, manifest["clipboard_id"])
+            _notify_consumed(peer, manifest["clipboard_id"], discovery)
             log.info("pasted text (%s) from %s",
                      config.format_size(manifest.get("total_size", 0)),
                      peer.get("name"))
@@ -486,9 +577,11 @@ def create_app(discovery=None, updater=None) -> Flask:
                 target = dest.joinpath(*parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target = _unique_path(target)
-                url = _peer_url(peer, "/api/clipboard/file/%s/%d"
-                                % (manifest["clipboard_id"], entry["index"]))
-                resp = requests.get(url, stream=True, timeout=TRANSFER_TIMEOUT)
+                resp = _peer_request(
+                    peer, "GET", "/api/clipboard/file/%s/%d"
+                    % (manifest["clipboard_id"], entry["index"]),
+                    discovery=discovery, stream=True,
+                    timeout=TRANSFER_TIMEOUT)
                 if resp.status_code == 410:
                     raise RuntimeError("peer clipboard changed during paste")
                 resp.raise_for_status()
@@ -514,9 +607,11 @@ def create_app(discovery=None, updater=None) -> Flask:
                 except OSError:
                     pass
             log.warning("paste from %s failed: %s", peer.get("name"), exc)
-            return _error("transfer failed: %s" % exc, 502)
+            if isinstance(exc, PeerUnreachable):
+                return _error(str(exc), 502)
+            return _error("transfer failed: %s" % _friendly_error(exc), 502)
 
-        _notify_consumed(peer, manifest["clipboard_id"])
+        _notify_consumed(peer, manifest["clipboard_id"], discovery)
 
         log.info("pasted %d files (%s) from %s into %s",
                  len(written), config.format_size(total_bytes),
@@ -606,13 +701,19 @@ def create_app(discovery=None, updater=None) -> Flask:
             return _error(str(exc), 400)
 
         try:
-            resp = requests.post(_peer_url(peer, "/api/offer"),
+            resp = _peer_request(peer, "POST", "/api/offer",
+                                 discovery=discovery,
                                  json=offers.wire_offer(offer),
                                  timeout=OFFER_TIMEOUT)
             resp.raise_for_status()
+        except PeerUnreachable as exc:
+            offers.manager.discard_outgoing(offer["offer_id"])
+            return _error(str(exc), 502)
         except Exception as exc:
             offers.manager.discard_outgoing(offer["offer_id"])
-            return _error("peer unreachable: %s" % exc, 502)
+            log.warning("offer to %s failed: %s", peer.get("name"), exc)
+            return _error("peer %s rejected the offer (%s)"
+                          % (peer.get("name"), _friendly_error(exc)), 502)
 
         log.info("offer %s sent to %s: %s", offer["offer_id"],
                  peer.get("name"), offers.summarize(offer))
@@ -705,6 +806,23 @@ def create_app(discovery=None, updater=None) -> Flask:
         log.info("declined offer %s from %s", offer_id,
                  offer.get("from", {}).get("name"))
         return jsonify({"declined": True})
+
+    # -- test hooks (CROSSCOPY_TEST_HOOKS=1 only) ------------------------------
+
+    if os.environ.get("CROSSCOPY_TEST_HOOKS") == "1":
+        @app.post("/api/_test/peer")
+        def api_test_peer():
+            """TEST ONLY: inject a raw peer record (id/name/host/port/
+            addresses/...) straight into the discovery registry, bypassing
+            selection and probing. Lets the network test harness simulate a
+            peer whose mDNS sighting picked an unroutable address. Never
+            registered unless the daemon runs with CROSSCOPY_TEST_HOOKS=1."""
+            body = request.get_json(silent=True) or {}
+            if discovery is None or not body.get("id"):
+                return _error("no discovery or missing 'id'", 400)
+            body.setdefault("last_seen", time.time())
+            discovery.inject_record_for_tests(body)
+            return jsonify(body)
 
     # -- web UI -------------------------------------------------------------
 

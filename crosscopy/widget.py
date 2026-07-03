@@ -22,6 +22,20 @@ BRAND_SOFT = (155, 183, 245, 255)     # lighter companion square
 APP_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium",
                 "chromium-browser", "brave-browser", "brave", "msedge",
                 "microsoft-edge")
+PANEL_SIZE = (420, 680)               # compact panel app-window, w x h
+
+
+def panel_command(exe, url):
+    """Command list to open `url` as a compact panel app-window.
+
+    `--window-size` keeps the `--app=` window from inheriting the browser's
+    last (often maximized) window size. No `--user-data-dir`: that would
+    fork a second browser profile. Caveat: when an already-running browser
+    process adopts the window, it may ignore `--window-size` — the panel's
+    own JS (widget.js fitPanelWindow) then resizes itself as a fallback.
+    """
+    return [exe, "--app=%s" % url,
+            "--window-size=%d,%d" % PANEL_SIZE]
 
 INSTALL_HINT = (
     "The tray widget needs the optional 'widget' extra (pystray + Pillow).\n"
@@ -323,7 +337,7 @@ class WidgetApp(object):
             exe = shutil.which(name)
             if exe:
                 try:
-                    subprocess.Popen([exe, "--app=%s" % url],
+                    subprocess.Popen(panel_command(exe, url),
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
                                      start_new_session=True)
@@ -466,6 +480,26 @@ def main():
         print("Could not start the cross-copy daemon. Check %s."
               % os.path.join(crosscopy_home(), "daemon.log"), file=sys.stderr)
         sys.exit(1)
+
+    # Pidfile so `ccp widget install/uninstall` can find a running widget;
+    # log the backend pystray picked (appindicator vs xorg matters on GNOME).
+    import atexit
+    import json as _json
+    pidfile = os.path.join(crosscopy_home(), "widget.json")
+
+    def _remove_pidfile():
+        try:
+            os.remove(pidfile)
+        except OSError:
+            pass
+
+    try:
+        with open(pidfile, "w") as f:
+            _json.dump({"pid": os.getpid()}, f)
+        atexit.register(_remove_pidfile)
+    except OSError:
+        pass
+    print("tray backend: %s" % pystray.Icon.__module__, file=sys.stderr)
 
     app = WidgetApp(pystray)
     try:

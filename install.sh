@@ -136,6 +136,11 @@ CCP=""
 if command -v pipx >/dev/null 2>&1; then
     info "Installing with pipx ..."
     pipx install --force "$SRC"
+    # Tray-widget extras (pystray/Pillow). Best-effort: the CLI works without.
+    if ! pipx inject cross-copy pystray Pillow >/dev/null 2>&1; then
+        warn "Could not install the tray-widget extras (pystray/Pillow)."
+        warn "The tray icon needs them:  pipx inject cross-copy pystray Pillow"
+    fi
     # Prefer the binary pipx just installed (~/.local/bin by default) over
     # `command -v ccp`, which can resolve to a different, pre-existing
     # install elsewhere on PATH.
@@ -150,10 +155,24 @@ else
     info "pipx not found — installing into a dedicated venv at $VENV_DIR"
     rm -rf "$VENV_DIR"
     mkdir -p "$(dirname "$VENV_DIR")"
-    "$PYTHON" -m venv "$VENV_DIR" \
+    # --system-site-packages on Linux: the tray icon renders through the
+    # desktop's AppIndicator support (PyGObject), which is a system package
+    # that pip cannot build cleanly — the venv must be able to see it.
+    VENV_FLAGS=""
+    if [ "$OS" = "Linux" ]; then
+        VENV_FLAGS="--system-site-packages"
+    fi
+    # shellcheck disable=SC2086
+    "$PYTHON" -m venv $VENV_FLAGS "$VENV_DIR" \
         || die "Failed to create a venv. On Debian/Ubuntu you may need:  sudo apt install python3-venv"
     "$VENV_DIR/bin/pip" install --quiet --upgrade pip
-    "$VENV_DIR/bin/pip" install --quiet "$SRC"
+    # Include the tray-widget extras (pystray/Pillow); fall back to a bare
+    # install if the extras can't be built on this machine.
+    if ! "$VENV_DIR/bin/pip" install --quiet "$SRC[widget]" 2>/dev/null; then
+        warn "Tray-widget extras failed to install; installing the base package."
+        warn "The tray icon needs them:  $VENV_DIR/bin/pip install pystray Pillow"
+        "$VENV_DIR/bin/pip" install --quiet "$SRC"
+    fi
 
     mkdir -p "$BIN_DIR"
     ln -sf "$VENV_DIR/bin/ccp" "$BIN_DIR/ccp"
@@ -203,6 +222,24 @@ if [ "$INSTALL_SERVICE" -eq 1 ]; then
 else
     info "Skipping autostart setup (--no-service)."
     info "Enable it later any time with:  ccp daemon install"
+fi
+
+# ---------------------------------------------------------------------------
+# 7b. Tray widget autostart (only when a graphical session is present)
+# ---------------------------------------------------------------------------
+if [ "$INSTALL_SERVICE" -eq 1 ]; then
+    if [ "$OS" = "Darwin" ] || [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        info "Setting up the tray widget (ccp widget install) ..."
+        if "$CCP" widget install; then
+            info "Tray widget enabled — look for the cross-copy icon in your status bar."
+        else
+            warn "Could not set up the tray widget (not fatal)."
+            warn "Run it manually with:  ccp widget    or retry:  ccp widget install"
+        fi
+    else
+        info "No graphical session detected — skipping the tray widget."
+        info "Enable it later from a desktop session with:  ccp widget install"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
