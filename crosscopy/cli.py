@@ -825,6 +825,7 @@ def cmd_decline(args):
 
 
 WIDGET_LAUNCHD_LABEL = "com.crosscopy.widget"
+MACOS_WIDGET_APP_NAME = "Cross Copy.app"
 
 
 def widget_autostart_desktop_path():
@@ -834,6 +835,70 @@ def widget_autostart_desktop_path():
 def widget_launchd_plist_path():
     return os.path.expanduser("~/Library/LaunchAgents/%s.plist"
                               % WIDGET_LAUNCHD_LABEL)
+
+
+def macos_widget_app_path():
+    return os.path.join(crosscopy_home(), MACOS_WIDGET_APP_NAME)
+
+
+def make_macos_widget_app():
+    """Create the LSUIElement app bundle used by the macOS launch agent.
+
+    Running an interpreter with a friendlier filename is not enough: AppKit
+    and LaunchServices still identify it as Python.  A real bundle supplies
+    the application name, bundle identifier, and icon expected by macOS.
+    """
+    app_path = macos_widget_app_path()
+    contents = os.path.join(app_path, "Contents")
+    macos_dir = os.path.join(contents, "MacOS")
+    resources = os.path.join(contents, "Resources")
+    os.makedirs(macos_dir, exist_ok=True)
+    os.makedirs(resources, exist_ok=True)
+
+    executable = os.path.join(macos_dir, "Cross Copy")
+
+    def shell_quote(value):
+        return "'" + value.replace("'", "'\\''") + "'"
+
+    with open(executable, "w") as f:
+        f.write("#!/bin/sh\nexec %s -m crosscopy.widget \"$@\"\n"
+                % shell_quote(sys.executable))
+    os.chmod(executable, 0o755)
+
+    icon_name = "AppIcon.icns"
+    try:
+        from crosscopy.macos import make_app_icon
+        make_app_icon().save(os.path.join(resources, icon_name), "ICNS")
+    except (ImportError, OSError, ValueError):
+        icon_name = None
+
+    info = {
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleDisplayName": "Cross Copy",
+        "CFBundleExecutable": "Cross Copy",
+        "CFBundleIdentifier": WIDGET_LAUNCHD_LABEL,
+        "CFBundleInfoDictionaryVersion": "6.0",
+        "CFBundleName": "Cross Copy",
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
+        "LSMinimumSystemVersion": "10.15",
+        "LSUIElement": True,
+        "NSHighResolutionCapable": True,
+    }
+    if icon_name:
+        info["CFBundleIconFile"] = icon_name
+    with open(os.path.join(contents, "Info.plist"), "wb") as f:
+        plistlib.dump(info, f)
+    os.utime(app_path, None)  # invalidate LaunchServices/Finder icon caches
+    return executable
+
+
+def remove_macos_widget_app():
+    try:
+        shutil.rmtree(macos_widget_app_path())
+    except OSError:
+        pass
 
 
 def stop_running_widget():
@@ -876,10 +941,10 @@ def spawn_widget():
 def cmd_widget_install():
     ensure_daemon()
     if sys.platform == "darwin":
-        launcher = make_macos_launcher()
+        launcher = make_macos_widget_app()
         plist = {
             "Label": WIDGET_LAUNCHD_LABEL,
-            "ProgramArguments": [launcher, "-m", "crosscopy.widget"],
+            "ProgramArguments": [launcher],
             "RunAtLoad": True,
             "KeepAlive": {"SuccessfulExit": False},
             "StandardOutPath": os.path.join(crosscopy_home(), "widget.log"),
@@ -949,6 +1014,7 @@ def cmd_widget_uninstall():
                 removed = True
             except OSError as e:
                 die("Could not remove %s: %s" % (plist_path, e))
+        remove_macos_widget_app()
     elif sys.platform.startswith("linux"):
         desktop_path = widget_autostart_desktop_path()
         if os.path.exists(desktop_path):

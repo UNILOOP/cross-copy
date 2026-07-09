@@ -223,6 +223,14 @@ def make_icon_image(dark_tray=False):
 
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
+    if sys.platform == "darwin":
+        # macOS menu extras are template images: one opaque colour plus alpha.
+        # pystray scales this to the current menu-bar thickness.
+        d.rounded_rectangle((8, 8, 39, 39), radius=7,
+                            outline=(0, 0, 0, 255), width=6)
+        d.rounded_rectangle((25, 25, 56, 56), radius=7,
+                            outline=(0, 0, 0, 255), width=6)
+        return img
     back = (255, 255, 255, 235) if dark_tray else BRAND_SOFT
     d.rounded_rectangle((6, 6, 42, 42), radius=10, fill=back)
     d.rounded_rectangle((22, 22, 58, 58), radius=10, fill=BRAND_BLUE,
@@ -715,13 +723,27 @@ class WidgetApp(object):
 
     def run(self):
         Menu = self.pystray.Menu
+        if sys.platform == "darwin":
+            from crosscopy.macos import configure_application
+            configure_application()
         self.icon = self.pystray.Icon(
             "cross-copy", icon=make_icon_image(),
-            title="cross-copy — %s" % (self.device.get("name") or "?"),
+            title="Cross Copy — %s" % (self.device.get("name") or "?"),
             menu=Menu(lambda: self.build_menu()))
         self.start_panel_server()  # darwin only: pre-warm the native panel
         threading.Thread(target=self.sse_loop, daemon=True).start()
-        self.icon.run()
+
+        def setup(icon):
+            icon.visible = True
+            if sys.platform == "darwin":
+                # pystray does not expose NSImage's template flag.  Marking it
+                # here lets macOS recolour the glyph for light/dark menu bars.
+                try:
+                    icon._icon_image.setTemplate_(True)
+                except (AttributeError, TypeError):
+                    pass
+
+        self.icon.run(setup=setup)
 
 
 def main():

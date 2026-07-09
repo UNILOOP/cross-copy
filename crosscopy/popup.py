@@ -471,6 +471,8 @@ def run_mac(args):
         def mouseDown_(self, event):
             AppKit.NSApp().terminate_(None)
 
+    from crosscopy.macos import configure_application
+    configure_application()
     app = AppKit.NSApplication.sharedApplication()
     # Accessory: no Dock icon, no menu bar takeover — it's a toast card.
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)

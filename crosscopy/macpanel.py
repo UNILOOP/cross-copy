@@ -58,6 +58,8 @@ def main():
               "pyobjc-framework-WebKit" % e, file=sys.stderr)
         sys.exit(DEPS_MISSING_EXIT)
 
+    from crosscopy.macos import configure_application
+    configure_application()
     app = AppKit.NSApplication.sharedApplication()
     # Accessory: no Dock icon, no menu bar takeover — it's a panel.
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
