@@ -11,7 +11,7 @@ Backends:
             aqua Tk (frameless windows often never appear or can't take
             clicks), so macOS renders each card with PyObjC instead
             (guaranteed present there: pystray depends on it).
-  other   — tkinter (verified working on Linux WMs).
+  other   — tkinter (Linux and Windows).
 Last resort (no backend could show a window): a plain OS notification via
 crosscopy.notify's platform helpers, so the user is never left in silence.
 
@@ -61,7 +61,7 @@ TEXT = "#edf1fa"
 MUTED = "#9aa3b5"
 OK = "#3ecf7a"
 FAIL = "#e46a76"
-FONT = "Helvetica"
+FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
 
 FAIL_TEXT = "Failed — see the cross-copy UI"
 
@@ -188,6 +188,13 @@ def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
+def set_tk_clipboard(root, text):
+    """Copy text and flush Tk's clipboard ownership before the popup exits."""
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    root.update()
+
+
 class Popup(object):
     def __init__(self, height, slot):
         import tkinter
@@ -283,8 +290,7 @@ def run_offer(offer_id, slot):
             elif res.get("kind") == "text":
                 text = res.get("text") or ""
                 try:
-                    ui.root.clipboard_clear()
-                    ui.root.clipboard_append(text)
+                    set_tk_clipboard(ui.root, text)
                     finish("Text copied to your clipboard")
                 except Exception:
                     finish("Text received")
@@ -372,8 +378,7 @@ def run_share(peer_id, clipboard_id, from_name, summary, kind, slot):
                 finish(FAIL_TEXT, color=FAIL)
             elif res.get("kind") == "text":
                 try:
-                    ui.root.clipboard_clear()
-                    ui.root.clipboard_append(res.get("text") or "")
+                    set_tk_clipboard(ui.root, res.get("text") or "")
                     finish("Text copied to your clipboard")
                 except Exception:
                     finish("Text received")
@@ -834,6 +839,9 @@ def fallback_os_notification(title, body):
             from crosscopy.notify import _notify_linux
             _notify_linux(title, body)
             return True
+        if sys.platform == "win32":
+            from crosscopy.notify import _notify_windows
+            return _notify_windows(title, body)
     except Exception:
         pass
     return False
@@ -876,6 +884,9 @@ def dry_run(args):
 
 
 def main(argv=None):
+    if sys.platform == "win32":
+        from crosscopy.windows import ensure_stdio
+        ensure_stdio(os.path.join(crosscopy_home(), "widget.log"))
     parser = argparse.ArgumentParser(prog="crosscopy.popup")
     sub = parser.add_subparsers(dest="mode")
     p = sub.add_parser("offer")

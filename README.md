@@ -1,6 +1,6 @@
 # cross-copy
 
-**A network clipboard for files *and text*, between your Mac and Linux machines.**
+**A network clipboard for files *and text*, between your Windows, Mac, and Linux machines.**
 
 `ccp copy` a file — or a snippet of text — on one machine, `ccp paste` on
 another — that's it. cross-copy discovers your machines automatically over mDNS
@@ -12,11 +12,11 @@ transfers until the other side accepts.
 ## 20-second demo
 
 ```console
-# On your Mac
+# On your Windows PC, Mac, or Linux box
 $ ccp copy notes.pdf
 Copied 1 file (2.4 MB) to the network clipboard.
 
-# On your Linux box
+# On another computer
 $ ccp paste
 Pasted notes.pdf (2.4 MB) from sayeed-macbook.
 ```
@@ -85,6 +85,40 @@ Good to know:
 
 ## Install
 
+### Windows
+
+Open **PowerShell** (no administrator access required) and run:
+
+```powershell
+irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.ps1 | iex
+```
+
+Or install from a cloned checkout:
+
+```powershell
+git clone https://github.com/UNILOOP/cross-copy.git
+cd cross-copy
+.\install.ps1
+```
+
+The Windows installer creates a dedicated environment under
+`%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and starts both the
+daemon and notification-area widget now and at login. Open a new PowerShell
+window after installation. If Windows Defender Firewall asks, allow Cross Copy
+on **Private networks** so your other LAN devices can connect.
+
+Use `.\install.ps1 -NoService` from a checkout to skip login autostart. To
+uninstall a one-line installation, run:
+
+```powershell
+irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/uninstall.ps1 | iex
+```
+
+From a checkout, use `.\uninstall.ps1`; add `-RemoveData` to also remove
+device configuration and logs.
+
+### macOS and Linux
+
 One-liner:
 
 ```sh
@@ -99,7 +133,7 @@ cd cross-copy
 ./install.sh
 ```
 
-The installer prefers [pipx](https://pipx.pypa.io) if you have it, otherwise it
+The macOS/Linux installer prefers [pipx](https://pipx.pypa.io) if you have it, otherwise it
 creates a self-contained venv and links `ccp` into `~/.local/bin`. It also
 enables daemon autostart at login **by default** (systemd user unit on Linux,
 launchd agent on macOS) — pass `--no-service` to skip that, and enable it later
@@ -107,7 +141,8 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 
 ### Requirements
 
-- Two or more machines on the **same LAN** (macOS and/or Linux)
+- Two or more machines on the **same LAN** (Windows, macOS, and/or Linux)
+- Windows 10/11, a supported macOS release, or a modern desktop Linux distribution
 - Python **3.9+**
 - That's it — the daemon auto-starts on first use
 
@@ -128,7 +163,7 @@ with `ccp daemon install`. To remove everything: `./uninstall.sh`.
 | `ccp add <host> [port]` | Manually add a peer by IP (when mDNS doesn't work) |
 | `ccp name <newname>` | Rename this device (defaults to hostname) |
 | `ccp daemon run\|start\|stop\|status` | Manage the background daemon directly |
-| `ccp daemon install` | Set up start-at-login (systemd user unit / launchd agent) and start the daemon now. `install.sh` runs this by default (`--no-service` to opt out) |
+| `ccp daemon install` | Set up start-at-login (Windows user login entry / systemd user unit / launchd agent) and start the daemon now. The platform installer runs this by default |
 | `ccp daemon uninstall` | Stop, disable, and remove the start-at-login service |
 | `ccp ui` | Open the web UI in your browser |
 | `ccp widget` | Run the menu-bar / system-tray companion in the foreground (see below) |
@@ -158,7 +193,7 @@ and restart the daemon to apply):
 |---|---|---|
 | `device_name` | your hostname | How this machine appears to others — or just run `ccp name <newname>` |
 | `receive_dir` | `~/Downloads/cross-copy` | Where files from **accepted offers** (`ccp send` → `ccp accept`) are saved; `~` is expanded. Override per-accept with `ccp accept [id] <dir>` |
-| `notifications` | `true` | Desktop notifications (macOS Notification Center, `notify-send`/D-Bus on Linux) for incoming offers, declines, and finished transfers. Set to `false` to silence them |
+| `notifications` | `true` | Desktop notifications (Windows banners, macOS Notification Center, `notify-send`/D-Bus on Linux) for incoming offers, declines, and finished transfers. Set to `false` to silence them |
 | `auto_update` | `true` | Let the daemon update itself automatically (see [Updates](#updates)) |
 
 ## Web UI 🖱️
@@ -183,12 +218,19 @@ ccp widget install   # start now + at every login (install.sh does this by defau
 ccp widget           # or run it in the foreground once
 ```
 
-Puts cross-copy in your **menu bar (macOS) / system tray (Linux)**: send
+Puts cross-copy in your **notification area (Windows) / menu bar (macOS) /
+system tray (Linux)**: send
 files or your clipboard text to any device in a couple of clicks, and accept
 or decline incoming offers without opening a terminal. **"Open panel"** pops
 a compact panel with the same controls, live-updating — a **native floating
-window** on macOS (WKWebView), a compact app window on Linux. Remove the
-autostart with `ccp widget uninstall`.
+window** on macOS (WKWebView), and a compact Edge/Chrome app window on Windows
+and Linux. Remove the autostart with `ccp widget uninstall`.
+
+On Windows, Python's standard Tcl/Tk option supplies the file picker,
+clipboard integration, and interactive notification cards. It is enabled by
+default in the official Python installer. Incoming offers have real
+**Accept/Decline** buttons; accepted text is placed on the Windows clipboard,
+and files are saved to `Downloads\cross-copy` by default.
 
 > **Ubuntu/GNOME note:** tray icons render through AppIndicator — the
 > installer builds its venv with `--system-site-packages` so the widget can
@@ -206,7 +248,7 @@ pip install "cross-copy[widget]"
 pipx install cross-copy && pipx inject cross-copy pystray Pillow
 ```
 
-Desktop notifications don't need the extra: on macOS and Linux the daemon
+Desktop notifications don't need the extra: on Windows, macOS, and Linux the daemon
 fires them natively whenever an offer arrives, is declined, or a transfer
 finishes.
 
@@ -238,7 +280,12 @@ finishes.
   `ccp add <ip>` on one side.
 - **Devices see each other but transfers fail** — a firewall is likely blocking
   the daemon port. Open **TCP 7373** (or your `CROSSCOPY_PORT`) on both
-  machines.
+  machines. On Windows, make sure the network is marked **Private** and allow
+  Python/Cross Copy through Windows Defender Firewall on Private networks.
+- **The Windows tray icon is missing** — run `ccp widget` in PowerShell to see
+  the startup error. The official Python installer includes Tcl/Tk; if you used
+  a custom Python distribution, reinstall with Tcl/Tk enabled and run
+  `ccp widget install` again.
 - **Want to try it on a single machine?** Run two instances side by side:
 
   ```sh
@@ -252,7 +299,7 @@ finishes.
 
 ## ⚠️ Security
 
-**v0.4.3 trusts your LAN.** There is no authentication or encryption yet: any
+**v0.5.0 trusts your LAN.** There is no authentication or encryption yet: any
 device on your network can read your cross-copy clipboard (files *and* text)
 and offer you files.
 Use it on networks you trust (home, small office) — **not** on public or

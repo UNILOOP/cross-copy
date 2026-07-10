@@ -4,7 +4,7 @@ Everything lives under ~/.crosscopy/ (override with CROSSCOPY_HOME):
   config.json    device name, device id (uuid4), manual peers list,
                  auto_update flag (default true), receive_dir (default
                  ~/Downloads/cross-copy), notifications flag (default true)
-  daemon.json    written by the running daemon: {"pid": int, "port": int}
+  daemon.json    running daemon identity: pid, port, and Windows start_time
   daemon.log     daemon output (written by the CLI's daemon-start redirect)
   staging/       files uploaded through the web UI
   clipboard.json current clipboard manifest
@@ -69,7 +69,7 @@ def get_port() -> int:
 
 
 def platform_name() -> str:
-    """'darwin' or 'linux' (anything else reported as-is)."""
+    """Stable peer-facing platform name (darwin/linux/win32)."""
     if sys.platform.startswith("darwin"):
         return "darwin"
     if sys.platform.startswith("linux"):
@@ -192,10 +192,14 @@ def add_manual_peer(host: str, port: int) -> None:
 # daemon.json
 
 def write_daemon_info(port: int, pid: int = None) -> None:
-    _atomic_write_json(daemon_json_path(), {
-        "pid": pid if pid is not None else os.getpid(),
-        "port": int(port),
-    })
+    process_id = pid if pid is not None else os.getpid()
+    info = {"pid": process_id, "port": int(port)}
+    if sys.platform == "win32":
+        from .windows import process_start_time
+        started = process_start_time(process_id)
+        if started is not None:
+            info["start_time"] = started
+    _atomic_write_json(daemon_json_path(), info)
 
 
 def read_daemon_info():

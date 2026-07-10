@@ -1,6 +1,6 @@
 # cross-copy — Design Spec (v0.1.0)
 
-Network clipboard for files between Mac and Linux machines on the same LAN.
+Network clipboard for files and text between Windows, Mac, and Linux machines on the same LAN.
 UX metaphor: `ccp copy file.txt` on machine A, `ccp paste` on machine B — the file appears.
 
 ## Components
@@ -23,7 +23,7 @@ Python >= 3.9. Dependencies: `flask`, `requests`, `zeroconf`. Nothing else.
   `daemon.json` (written by running daemon: `{"pid": int, "port": int}`, removed on clean exit),
   `daemon.log`, `staging/` (web-UI uploaded files), `clipboard.json` (current manifest).
 - Zeroconf service type: `_crosscopy._tcp.local.`; service name `<device_id>._crosscopy._tcp.local.`;
-  TXT properties: `id`, `name`, `platform` (`darwin`/`linux`), `version`.
+  TXT properties: `id`, `name`, `platform` (`darwin`/`linux`/`win32`), `version`.
 - Env `CROSSCOPY_NO_MDNS=1` disables zeroconf (for tests; manual peers still work).
 - Device name defaults to hostname; changeable via `config.json` / `ccp name <newname>`.
 
@@ -60,6 +60,10 @@ field (the full string, UTF-8, max 1 MB — reject larger with 400), no `files` 
     `ProgramArguments = [<sys.executable>, "-m", "crosscopy.daemon"]`, `RunAtLoad`,
     `KeepAlive.SuccessfulExit=false`; load via `launchctl bootstrap gui/<uid>` with
     `launchctl load -w` fallback (older macOS).
+  - Windows: hidden `pythonw.exe`/`.pyw` launcher registered in the current
+    user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` key. It avoids
+    a console flash and forwards `CROSSCOPY_HOME`/`CROSSCOPY_PORT`.
+    Installation immediately starts the detached daemon; no admin rights are required.
   - Stops any already-running daemon first so the service owns the port.
 - `ccp daemon uninstall` — stop + disable + remove the unit/plist.
 - install.sh sets up autostart by DEFAULT by calling `ccp daemon install`
@@ -105,7 +109,7 @@ reach the other, both end up knowing each other.
 - Daemon auto-update: config `auto_update` (default **true**). Background thread checks
   ~90 s after start and every 6 h. If a newer version is found: with auto_update on, run
   self-update, then re-exec (`os.execv(sys.executable, [python, -m, crosscopy.daemon])`) to
-  load the new code (PID preserved — safe under systemd/launchd); with auto_update off, just
+  load the new code (PID preserved where the OS supports exec); with auto_update off, just
   record it. `/api/status` gains `"update": {"current","latest","available": bool,
   "last_checked", "auto_update": bool}` (latest/last_checked null before first check).
 - CLI: `ccp update` — check + self-update + daemon restart (stop/start) + print old→new;
@@ -197,18 +201,19 @@ action buttons and looked bad on Linux:
   target/selector `NSTimer`s for auto-dismiss/offer-poll, HTTP on worker threads with UI
   dispatched back via `NSOperationQueue.mainQueue`), because tkinter
   `overrideredirect` windows are unreliable on aqua Tk (cards never appear / can't take
-  clicks). PyObjC is guaranteed present there (pystray depends on it). **Linux/other**
-  keeps the tkinter cards. `--dry-run` prints computed geometry/content JSON on both.
+  clicks). PyObjC is guaranteed present there (pystray depends on it). **Windows/Linux**
+  use tkinter cards (Segoe UI on Windows). `--dry-run` prints computed
+  geometry/content JSON on every platform.
 - Last-resort fallback: if no windowing backend can show a card (AppKit **and** tkinter
-  fail on mac; tkinter fails on Linux), the popup process fires a plain OS notification
-  via `crosscopy.notify`'s platform helpers directly (osascript / notify-send),
+  fail on mac; tkinter fails on Windows/Linux), the popup process fires a plain OS notification
+  via `crosscopy.notify`'s platform helpers directly (Shell_NotifyIconW / osascript / notify-send),
   bypassing notify()'s widget-connected suppression — the popup IS the widget's
   notification path, so the user is never left with silence.
 - The widget subscribes to `/api/events?client=widget`. While any `client=widget`
   subscriber is connected, `notify()` suppresses OS notifications entirely (the widget pops
   its own cards on `offers` events by diffing `/api/offers`). No widget running → OS
   notifications remain as fallback.
-- `ccp update` restarts a running tray widget after a successful self-update (SIGTERM
+- `ccp update` restarts a running tray widget after a successful self-update (process termination
   via `widget.json` pid, then respawn — unless launchd/autostart already brought it
   back), so the widget and its popup cards never keep running stale code. It also
   verifies the restarted daemon reports the just-installed version and warns loudly when
@@ -230,8 +235,23 @@ action buttons and looked bad on Linux:
   accept/decline, live via SSE. macOS: a native floating NSWindow + WKWebView
   (`crosscopy/macpanel.py`, own subprocess, 420x680 top-right, floating level, no Dock
   icon; needs `pyobjc-framework-WebKit`, in the widget extra; exit code 3 = missing deps →
-  fall back). Linux/fallback: browser app-mode (`--app=` `--window-size=420,680` for
-  chrome/chromium/brave; macOS bundle paths checked too), last resort plain tab.
+  fall back). Windows/Linux fallback: browser app-mode (`--app=`
+  `--window-size=420,680` for Edge/Chrome/Chromium/Brave; Windows install
+  locations and macOS bundle paths are checked too), last resort plain tab.
+
+## Windows support
+
+- `install.ps1` installs a dedicated venv under `%LOCALAPPDATA%\CrossCopy`,
+  includes the `widget` extra, creates a `ccp.cmd` user-PATH shim, and enables
+  daemon/widget login startup by default. `uninstall.ps1` reverses it and keeps
+  `~\.crosscopy` unless asked to remove data.
+- Detached child processes use `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`;
+  the login launcher uses a venv-local `pythonw.exe` copy named `Cross Copy.exe`
+  and redirects missing stdio to daemon/widget logs.
+- The pystray Win32 backend provides the notification-area menu. Tk provides
+  native file selection, clipboard text access, and actionable popup cards.
+- With no connected widget, `crosscopy.winnotify` uses the inbox Win32
+  `Shell_NotifyIconW` API to display a banner without third-party packages.
 
 ## Liquid glass design (v0.4)
 

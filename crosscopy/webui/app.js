@@ -81,6 +81,7 @@
   function platformIcon(platform) {
     if (platform === "darwin") return "🍎"; // apple
     if (platform === "linux") return "🐧";  // penguin
+    if (platform === "win32") return "🪟";  // windows
     return "💻";                            // laptop
   }
 

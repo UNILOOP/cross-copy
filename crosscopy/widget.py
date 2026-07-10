@@ -16,6 +16,8 @@ import webbrowser
 
 import requests
 
+from crosscopy.windows import background_popen_kwargs
+
 DEFAULT_PORT = 7373
 BRAND_BLUE = (47, 111, 237, 255)      # #2f6fed
 BRAND_SOFT = (155, 183, 245, 255)     # lighter companion square
@@ -31,6 +33,21 @@ MAC_APP_BROWSERS = (
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
 )
 PANEL_SIZE = (420, 680)               # compact panel app-window, w x h
+
+
+def windows_app_browsers():
+    """Installed Chromium browsers that can host a compact --app window."""
+    roots = [os.environ.get("PROGRAMFILES"),
+             os.environ.get("PROGRAMFILES(X86)"),
+             os.environ.get("LOCALAPPDATA")]
+    relative = (
+        os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser", "Application",
+                     "brave.exe"),
+    )
+    return [os.path.join(root, rel) for root in roots if root
+            for rel in relative if os.path.exists(os.path.join(root, rel))]
 
 
 def panel_command(exe, url):
@@ -126,7 +143,7 @@ def ensure_daemon():
     with open(os.path.join(home, "daemon.log"), "ab") as log:
         subprocess.Popen([sys.executable, "-m", "crosscopy.daemon"],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                         start_new_session=True)
+                         **background_popen_kwargs())
     deadline = time.time() + 5.0
     while time.time() < deadline:
         info = ping(timeout=0.5)
@@ -152,7 +169,7 @@ def spawn_popup(*args):
     try:
         return subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=stderr, start_new_session=True)
+            stderr=stderr, **background_popen_kwargs())
     except OSError as e:
         log_line("popup spawn failed: %s (args: %s)"
                  % (e, " ".join(argv[3:])))
@@ -242,8 +259,8 @@ def make_icon_image(dark_tray=False):
 # tkinter helpers (lazy — tkinter may be missing on minimal installs)
 # ---------------------------------------------------------------------------
 
-TK_HINT = ("tkinter is not available. Install your platform's python3-tk "
-           "package (e.g. 'sudo apt install python3-tk').")
+TK_HINT = ("tkinter is not available. On Linux, install python3-tk; on "
+           "Windows, reinstall Python with the Tcl/Tk option enabled.")
 
 
 def _tk_root():
@@ -552,7 +569,7 @@ class WidgetApp(object):
                     subprocess.Popen(panel_command(exe, url),
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
-                                     start_new_session=True)
+                                     **background_popen_kwargs())
                     return
                 except OSError:
                     pass
@@ -564,10 +581,20 @@ class WidgetApp(object):
                         subprocess.Popen(panel_command(bundle_exe, url),
                                          stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL,
-                                         start_new_session=True)
+                                         **background_popen_kwargs())
                         return
                     except OSError:
                         pass
+        if sys.platform == "win32":
+            for exe in windows_app_browsers():
+                try:
+                    subprocess.Popen(panel_command(exe, url),
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL,
+                                     **background_popen_kwargs())
+                    return
+                except OSError:
+                    pass
         webbrowser.open(url)
 
     def _open_mac_panel(self, url):
@@ -639,7 +666,8 @@ class WidgetApp(object):
         peers = self.fetch_peers()
         if peers:
             for peer in peers:
-                plat = {"darwin": "mac", "linux": "linux"}.get(
+                plat = {"darwin": "mac", "linux": "linux",
+                        "win32": "windows"}.get(
                     peer.get("platform"), peer.get("platform") or "?")
                 items.append(Item(
                     "%s (%s)" % (peer.get("name") or peer.get("id"), plat),
@@ -747,6 +775,16 @@ class WidgetApp(object):
 
 
 def main():
+    process_started = None
+    if sys.platform == "win32":
+        from crosscopy.windows import (acquire_widget_mutex, ensure_stdio,
+                                       process_start_time)
+        ensure_stdio(widget_log_path())
+        if not acquire_widget_mutex(crosscopy_home()):
+            print("Another Cross Copy tray widget is already running.",
+                  file=sys.stderr)
+            return
+        process_started = process_start_time(os.getpid())
     try:
         import pystray  # noqa: F401
         from PIL import Image  # noqa: F401
@@ -782,7 +820,10 @@ def main():
 
     try:
         with open(pidfile, "w") as f:
-            _json.dump({"pid": os.getpid()}, f)
+            record = {"pid": os.getpid()}
+            if process_started is not None:
+                record["start_time"] = process_started
+            _json.dump(record, f)
         atexit.register(_remove_pidfile)
     except OSError:
         pass

@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import sys
+import time
 
 from . import __version__, config
 from .discovery import Discovery
@@ -59,6 +60,15 @@ def _restart_daemon():
     """Re-exec the daemon in place after a successful self-update (called
     from the updater thread). The PID is preserved, so systemd/launchd keep
     supervising the same process."""
+    log.info("restarting desktop processes to load the updated code")
+    try:
+        # Login startup entries are not supervisors on Windows. Restart the
+        # already-running widget explicitly so it does not keep old modules
+        # loaded until the user's next login.
+        from .cli import restart_widget_after_update
+        restart_widget_after_update(quiet=True)
+    except Exception as exc:
+        log.warning("could not restart tray widget after update: %s", exc)
     log.info("restarting daemon to load the updated code (execv)")
     discovery = _cleanup_state["discovery"]
     if discovery is not None:
@@ -90,10 +100,19 @@ def _restart_daemon():
         os.chdir(os.path.expanduser("~"))
     except OSError:
         pass
+    if sys.platform == "win32":
+        from .windows import release_daemon_mutex
+        # Windows' C-runtime exec launches the replacement while the old
+        # process is still unwinding. Give its socket and mutex time to close.
+        os.environ["CROSSCOPY_RESTART_DELAY"] = "0.5"
+        release_daemon_mutex()
     os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
 
 
 def main():
+    if sys.platform == "win32":
+        from .windows import ensure_stdio
+        ensure_stdio(str(config.daemon_log_path()))
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stdout,
@@ -105,6 +124,19 @@ def main():
     home = config.get_home()
     port = config.get_port()
     cfg = config.load_config()
+
+    if sys.platform == "win32":
+        try:
+            delay = float(os.environ.pop("CROSSCOPY_RESTART_DELAY", "0"))
+        except ValueError:
+            delay = 0
+        if delay > 0:
+            time.sleep(min(delay, 5.0))
+        from .windows import acquire_daemon_mutex
+        if not acquire_daemon_mutex(home, port):
+            log.info("another cross-copy daemon already owns home=%s port=%d",
+                     home, port)
+            return
 
     config.write_daemon_info(port)
     atexit.register(_cleanup)

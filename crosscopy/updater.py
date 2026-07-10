@@ -84,7 +84,11 @@ def self_update() -> bool:
 
     Adds --user when running outside a venv. Output is captured and logged
     (the daemon's stdout goes to daemon.log)."""
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    executable = sys.executable
+    if sys.platform == "win32":
+        from .windows import console_python_executable
+        executable = console_python_executable()
+    cmd = [executable, "-m", "pip", "install", "--upgrade"]
     if sys.prefix == sys.base_prefix:  # not in a virtualenv
         cmd.append("--user")
     cmd.append(pkg_url())

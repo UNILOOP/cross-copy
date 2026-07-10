@@ -32,6 +32,7 @@ notifications fire on: incoming offer (receiver), declined/completed/failed
 
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -72,6 +73,36 @@ def safe_rel_parts(rel_path: str):
     return parts
 
 
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+
+def local_path_parts(parts, platform=None):
+    """Make validated wire path parts writable on the receiving OS.
+
+    Linux and macOS preserve names. Windows substitutes characters its file
+    APIs reject and prefixes reserved DOS device names, so a Linux peer's
+    otherwise-valid file cannot make the whole transfer fail.
+    """
+    platform = sys.platform if platform is None else platform
+    if platform != "win32":
+        return tuple(parts)
+    cleaned = []
+    invalid = set('<>:"/\\|?*')
+    for part in parts:
+        name = "".join("_" if ch in invalid or ord(ch) < 32 else ch
+                       for ch in part).rstrip(" .")
+        if not name:
+            name = "_"
+        if name.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+            name = "_" + name
+        cleaned.append(name)
+    return tuple(cleaned)
+
+
 def unique_path(path: Path) -> Path:
     """Collision-rename: 'name.ext' -> 'name (1).ext', 'name (2).ext', ..."""
     if not path.exists():
@@ -83,6 +114,80 @@ def unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         n += 1
+
+
+def _collision_component(name, number, is_dir):
+    if is_dir:
+        return "%s (%d)" % (name, number)
+    path = Path(name)
+    return "%s (%d)%s" % (path.stem, number, path.suffix)
+
+
+def plan_local_paths(paths, dest: Path, platform=None):
+    """Plan collision-safe local paths for a complete incoming manifest.
+
+    Planning the hierarchy as a unit is important on Windows: distinct peer
+    names such as ``a?`` and ``a*`` sanitize to the same component. Resolving
+    only the final filename would merge those directories or turn a file into
+    another entry's parent. The returned list stays aligned with ``paths``.
+    """
+    platform = sys.platform if platform is None else platform
+    source_paths = [tuple(parts) for parts in paths]
+    tree = {"children": {}, "terminal": False}
+    for parts in source_paths:
+        node = tree
+        for part in parts:
+            node = node["children"].setdefault(
+                part, {"children": {}, "terminal": False})
+        node["terminal"] = True
+
+    mapped = {}
+
+    def key(name):
+        return name.casefold() if platform == "win32" else name
+
+    def walk(node, source_prefix, local_prefix, local_parent):
+        used = set()
+        for original, child in node["children"].items():
+            if child["terminal"] and child["children"]:
+                raise RuntimeError(
+                    "incoming manifest uses a path as both file and directory: %r"
+                    % "/".join(source_prefix + (original,)))
+            base = local_path_parts((original,), platform=platform)[0]
+            is_dir = bool(child["children"])
+            candidate = base
+            number = 1
+            while (key(candidate) in used
+                   or (local_parent / candidate).exists()):
+                candidate = _collision_component(base, number, is_dir)
+                number += 1
+            used.add(key(candidate))
+            source_path = source_prefix + (original,)
+            local_path = local_prefix + (candidate,)
+            if child["terminal"]:
+                mapped[source_path] = local_path
+            if child["children"]:
+                walk(child, source_path, local_path,
+                     local_parent / candidate)
+
+    walk(tree, (), (), Path(dest))
+
+    # Duplicate manifest entries are kept distinct too. They are unusual but
+    # should not overwrite one another if received from a malformed peer.
+    result = []
+    used_targets = set()
+    for source_path in source_paths:
+        local = mapped[source_path]
+        candidate = local
+        number = 1
+        while (tuple(key(part) for part in candidate) in used_targets
+               or Path(dest).joinpath(*candidate).exists()):
+            last = _collision_component(local[-1], number, False)
+            candidate = local[:-1] + (last,)
+            number += 1
+        used_targets.add(tuple(key(part) for part in candidate))
+        result.append(candidate)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -339,14 +444,18 @@ def pull_files(offer: dict, dest: Path):
     written = []
     total_bytes = 0
     try:
-        for entry in offer.get("files", []):
+        entries = offer.get("files", [])
+        source_parts = []
+        for entry in entries:
             parts = safe_rel_parts(entry.get("rel_path", ""))
             if parts is None:
                 raise RuntimeError("unsafe rel_path from peer: %r"
                                    % entry.get("rel_path"))
+            source_parts.append(parts)
+        planned = plan_local_paths(source_parts, dest)
+        for entry, parts in zip(entries, planned):
             target = dest.joinpath(*parts)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target = unique_path(target)
             url = "%s/api/offer/%s/file/%d" % (
                 sender_base_url(offer), offer["offer_id"], int(entry["index"]))
             resp = requests.get(url, stream=True, timeout=TRANSFER_TIMEOUT)

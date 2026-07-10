@@ -4,6 +4,7 @@ notify(title, body): never raises, no new dependencies.
   macOS: `osascript -e 'display notification ...'`
   Linux: `notify-send` if on PATH, else `gdbus call
          org.freedesktop.Notifications.Notify`, else silent no-op.
+  Windows: a hidden stdlib helper using Shell_NotifyIconW.
 
 Gated by the "notifications" config key (default true). All commands run as
 argument lists (never shell=True); the strings interpolated into the
@@ -38,7 +39,8 @@ def notify(title, body) -> None:
             _notify_macos(title, body)
         elif sys.platform.startswith("linux"):
             _notify_linux(title, body)
-        # other platforms: silent no-op
+        elif sys.platform == "win32":
+            _notify_windows(title, body)
     except Exception as exc:  # pragma: no cover - defensive
         log.debug("notification failed: %s", exc)
 
@@ -70,6 +72,21 @@ def _notify_linux(title: str, body: str) -> None:
             "cross-copy", "0", "", title, body, "[]", "{}", "5000",
         ])
     # neither tool available: silent no-op
+
+
+def _notify_windows(title: str, body: str) -> bool:
+    """Launch the Win32 banner helper without opening a console."""
+    try:
+        from crosscopy.windows import (background_popen_kwargs,
+                                       pythonw_executable)
+        subprocess.Popen(
+            [pythonw_executable(), "-m", "crosscopy.winnotify", title, body],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, **background_popen_kwargs())
+        return True
+    except Exception as exc:
+        log.debug("Windows notification helper failed: %s", exc)
+        return False
 
 
 def _run(argv) -> bool:

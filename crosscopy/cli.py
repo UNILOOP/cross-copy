@@ -19,6 +19,8 @@ import webbrowser
 
 import requests
 
+from crosscopy.windows import background_popen_kwargs
+
 try:
     from crosscopy import __version__
 except Exception:  # pragma: no cover - package may not define it yet
@@ -94,6 +96,19 @@ def err(msg):
 def die(msg, code=1):
     err(msg)
     sys.exit(code)
+
+
+def write_verbatim_stdout(text):
+    """Write peer text predictably, including redirected Windows output."""
+    payload = text if text.endswith("\n") else text + "\n"
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    binary = getattr(sys.stdout, "buffer", None)
+    if sys.platform == "win32" and not is_tty and binary is not None:
+        binary.write(payload.encode("utf-8"))
+        binary.flush()
+    else:
+        sys.stdout.write(payload)
+        sys.stdout.flush()
 
 
 def human_size(n):
@@ -223,10 +238,10 @@ def spawn_daemon():
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
-            start_new_session=True,
             # Neutral CWD: a crosscopy/ dir in the caller's CWD would land
             # on sys.path and shadow the installed package.
             cwd=os.path.expanduser("~"),
+            **background_popen_kwargs()
         )
     finally:
         log.close()
@@ -257,6 +272,12 @@ def ensure_daemon():
 
 
 def pid_alive(pid):
+    if sys.platform == "win32":
+        from crosscopy.windows import pid_alive as windows_pid_alive
+        try:
+            return windows_pid_alive(pid)
+        except (OSError, ValueError, TypeError):
+            return False
     try:
         os.kill(pid, 0)
         return True
@@ -270,10 +291,16 @@ def pid_alive(pid):
 
 def terminate_pid(pid, wait=5.0):
     """SIGTERM a pid and wait for it to exit. Returns an error string or None."""
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as e:
-        return "Failed to stop daemon (pid %d): %s" % (pid, e)
+    if sys.platform == "win32":
+        code, output = run_cmd(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"])
+        if code != 0 and pid_alive(pid):
+            return "Failed to stop daemon (pid %d): %s" % (pid, output)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            return "Failed to stop daemon (pid %d): %s" % (pid, e)
     deadline = time.time() + wait
     while time.time() < deadline and pid_alive(pid):
         time.sleep(0.1)
@@ -306,7 +333,29 @@ def probe_orphan_daemon():
     return True, (pid if pid and pid > 0 else None)
 
 
+def remove_daemon_pidfile():
+    try:
+        os.remove(os.path.join(crosscopy_home(), "daemon.json"))
+    except OSError:
+        pass
+
+
+def windows_daemon_pid_is_verified(pid, answering=None, reported_pid=None,
+                                   start_time=None):
+    """Verify a Windows daemon PID by API, or creation time if it is hung."""
+    if sys.platform != "win32":
+        return True
+    if answering is None:
+        answering, reported_pid = probe_orphan_daemon()
+    if answering:
+        return reported_pid == pid
+    from crosscopy.windows import pid_matches_start_time
+    return pid_matches_start_time(pid, start_time)
+
+
 def lsof_hint():
+    if sys.platform == "win32":
+        return "netstat -ano | findstr :%d" % daemon_port()
     return "lsof -nP -iTCP:%d -sTCP:LISTEN" % daemon_port()
 
 
@@ -325,14 +374,21 @@ def stop_running_daemon():
         pid = int(pid) if pid else None
     except (TypeError, ValueError):
         pid = None
-    if pid and pid_alive(pid):
+    answering, orphan_pid = probe_orphan_daemon()
+    if (pid and pid_alive(pid)
+            and windows_daemon_pid_is_verified(
+                pid, answering, orphan_pid, (info or {}).get("start_time"))):
         print("Stopping the running daemon (pid %d) so the service can take over..."
               % pid)
         error = terminate_pid(pid)
         if error:
             die(error + "\nStop it manually, then re-run 'ccp daemon install'.")
+        remove_daemon_pidfile()
         return
-    answering, orphan_pid = probe_orphan_daemon()
+    if pid and sys.platform == "win32":
+        # A live but uncorroborated PID may have been recycled. Never taskkill
+        # it merely because a stale daemon.json still names it.
+        remove_daemon_pidfile()
     if not answering:
         return
     if orphan_pid and pid_alive(orphan_pid):
@@ -341,6 +397,7 @@ def stop_running_daemon():
         error = terminate_pid(orphan_pid)
         if error:
             die(error + "\nStop it manually, then re-run 'ccp daemon install'.")
+        remove_daemon_pidfile()
         return
     err("⚠️  A daemon is answering on port %d, but it reports no pid (an "
         "older version)" % daemon_port())
@@ -543,10 +600,7 @@ def cmd_paste(args):
         # Verbatim to stdout so `ccp paste > out.txt` / `ccp paste | pbcopy`
         # work; the info line goes to stderr.
         text = result.get("text", "")
-        sys.stdout.write(text)
-        if not text.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+        write_verbatim_stdout(text)
         err("📥 from %s" % src_name)
         if result.get("op") == "move":
             err("   Source clipboard was cleared on %s." % src_name)
@@ -788,10 +842,7 @@ def cmd_accept(args):
         # Verbatim to stdout so it pipes; the info line goes to stderr
         # (exactly like `ccp paste` with a text clipboard).
         text = result.get("text", "")
-        sys.stdout.write(text)
-        if not text.endswith("\n"):
-            sys.stdout.write("\n")
-        sys.stdout.flush()
+        write_verbatim_stdout(text)
         err("📥 from %s" % src_name)
         return
 
@@ -906,14 +957,20 @@ def stop_running_widget():
     path = os.path.join(crosscopy_home(), "widget.json")
     try:
         with open(path) as f:
-            pid = int(json.load(f)["pid"])
+            info = json.load(f)
+            pid = int(info["pid"])
     except (OSError, ValueError, KeyError, TypeError):
         return
     if pid_alive(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        if sys.platform == "win32":
+            from crosscopy.windows import pid_matches_start_time
+            if pid_matches_start_time(pid, info.get("start_time")):
+                run_cmd(["taskkill", "/PID", str(pid), "/T", "/F"])
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
     try:
         os.remove(path)
     except OSError:
@@ -926,13 +983,17 @@ def spawn_widget():
     os.makedirs(home, exist_ok=True)
     log = open(os.path.join(home, "widget.log"), "ab")
     try:
+        executable = sys.executable
+        if sys.platform == "win32":
+            from crosscopy.windows import make_windows_launcher
+            executable = make_windows_launcher()
         subprocess.Popen(
-            [sys.executable, "-m", "crosscopy.widget"],
+            [executable, "-m", "crosscopy.widget"],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
-            start_new_session=True,
             cwd=os.path.expanduser("~"),
+            **background_popen_kwargs()
         )
     finally:
         log.close()
@@ -995,8 +1056,29 @@ def cmd_widget_install():
                 pass
             die("The tray widget did not stay running. Recent log:\n%s\n"
                 "   Log file: %s" % (tail.rstrip(), log_path))
+    elif sys.platform == "win32":
+        from crosscopy.windows import (launch_startup_entry,
+                                       write_startup_launcher)
+        launcher_path = write_startup_launcher("widget", "crosscopy.widget")
+        stop_running_widget()
+        launch_startup_entry("widget")
+        time.sleep(2.0)
+        pidfile = os.path.join(crosscopy_home(), "widget.json")
+        if os.path.exists(pidfile):
+            print("✅ Tray widget running now and will start at login (%s)."
+                  % launcher_path)
+        else:
+            log_path = os.path.join(crosscopy_home(), "widget.log")
+            tail = ""
+            try:
+                with open(log_path) as f:
+                    tail = "".join(f.readlines()[-4:])
+            except OSError:
+                pass
+            die("The tray widget did not stay running. Recent log:\n%s\n"
+                "   Log file: %s" % (tail.rstrip(), log_path))
     else:
-        die("The tray widget is only supported on macOS and Linux.")
+        die("The tray widget is only supported on macOS, Linux, and Windows.")
 
 
 def cmd_widget_uninstall():
@@ -1023,6 +1105,9 @@ def cmd_widget_uninstall():
                 removed = True
             except OSError as e:
                 die("Could not remove %s: %s" % (desktop_path, e))
+    elif sys.platform == "win32":
+        from crosscopy.windows import remove_startup_launcher
+        removed = remove_startup_launcher("widget")
     stop_running_widget()
     if removed:
         print("✅ Tray widget autostart removed.")
@@ -1241,9 +1326,14 @@ def run_self_update():
 
 
 def daemon_process_command(pid):
-    """Best-effort command line of a pid (`ps -p <pid> -o command=`,
-    works on macOS and Linux). None when unavailable."""
+    """Best-effort description of a daemon pid. None when unavailable."""
     try:
+        if sys.platform == "win32":
+            proc = subprocess.run(
+                ["tasklist", "/FI", "PID eq %d" % int(pid), "/FO", "LIST"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=5)
+            return (proc.stdout or "").strip() or None
         proc = subprocess.run(["ps", "-p", str(int(pid)), "-o", "command="],
                               stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=5)
@@ -1303,10 +1393,9 @@ def check_daemon_version_after_update(info, expected):
 def restart_daemon_after_update(expected_version=None):
     """Stop the running daemon so the new code loads.
 
-    If a systemd/launchd service is installed, its Restart/KeepAlive policy
-    brings the daemon back by itself — poll ping briefly and only spawn one
-    manually if nothing came back. Once it's back, verify it reports the
-    just-installed version (split-environment detection).
+    If a supervising service is installed, it may bring the daemon back by
+    itself. Poll ping briefly and only spawn one manually if nothing came
+    back. Once it is back, verify the just-installed version.
     """
     info = read_daemon_json()
     pid = (info or {}).get("pid")
@@ -1314,13 +1403,24 @@ def restart_daemon_after_update(expected_version=None):
         pid = int(pid) if pid else None
     except (TypeError, ValueError):
         pid = None
-    if pid and pid_alive(pid):
+    answering, reported_pid = probe_orphan_daemon()
+    if (pid and pid_alive(pid)
+            and windows_daemon_pid_is_verified(
+                pid, answering, reported_pid, (info or {}).get("start_time"))):
         error = terminate_pid(pid)
         if error:
             err(error)
             err("Restart it manually to load the new version: "
                 "ccp daemon stop && ccp daemon start")
             return
+        remove_daemon_pidfile()
+    elif pid and sys.platform == "win32":
+        remove_daemon_pidfile()
+        if reported_pid and reported_pid != pid and pid_alive(reported_pid):
+            error = terminate_pid(reported_pid)
+            if error:
+                err(error)
+                return
     back = wait_for_ping(3.0)  # service manager may restart it by itself
     if not back:
         spawn_daemon()
@@ -1332,32 +1432,56 @@ def restart_daemon_after_update(expected_version=None):
     check_daemon_version_after_update(back, expected_version)
 
 
-def read_widget_pid():
-    """pid from ~/.crosscopy/widget.json, or None."""
+def read_widget_info():
+    """Widget process identity from ~/.crosscopy/widget.json, or None."""
     try:
         with open(os.path.join(crosscopy_home(), "widget.json")) as f:
-            return int(json.load(f)["pid"])
+            info = json.load(f)
+        info["pid"] = int(info["pid"])
+        return info
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
+def read_widget_pid():
+    info = read_widget_info()
+    return info["pid"] if info else None
+
+
+def widget_pid_is_verified(info):
+    if not info:
+        return False
+    pid = info.get("pid")
+    if not pid_alive(pid):
+        return False
+    if sys.platform != "win32":
+        return True
+    from crosscopy.windows import pid_matches_start_time
+    return pid_matches_start_time(pid, info.get("start_time"))
+
+
 def restart_widget_after_update(quiet=False):
     """If a tray widget is running, restart it so it loads the new code
-    (without this, Macs keep running the old widget — and its old popup
+    (without this, desktops keep running the old widget — and its old popup
     backend — after every update). Best-effort: never fatal.
 
-    After SIGTERM we briefly poll for a NEW live pid in widget.json: the
-    macOS launchd widget agent has KeepAlive and respawns it on its own —
-    only spawn one ourselves when nothing came back.
+    After SIGTERM we briefly poll for a NEW live pid in widget.json: a service
+    manager may respawn it on its own. Only spawn one when nothing came back.
     """
     try:
-        pid = read_widget_pid()
-        if not pid or not pid_alive(pid):
+        info = read_widget_info()
+        if not widget_pid_is_verified(info):
             return  # no widget running — nothing to restart
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            return
+        pid = info["pid"]
+        if sys.platform == "win32":
+            code, _ = run_cmd(["taskkill", "/PID", str(pid), "/T", "/F"])
+            if code != 0:
+                return
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                return
         deadline = time.time() + 2.0
         while time.time() < deadline and pid_alive(pid):
             time.sleep(0.1)
@@ -1421,7 +1545,7 @@ def cmd_update(args):
 
 
 # ---------------------------------------------------------------------------
-# Daemon autostart (systemd user unit / launchd agent)
+# Daemon autostart (systemd / launchd / Windows per-user Run entry)
 # ---------------------------------------------------------------------------
 
 def systemd_unit_path():
@@ -1590,8 +1714,15 @@ def cmd_daemon_install():
         stop_running_daemon()
         install_systemd()
         what = "systemd user service"
+    elif sys.platform == "win32":
+        from crosscopy.windows import (launch_startup_entry,
+                                       write_startup_launcher)
+        stop_running_daemon()
+        launcher_path = write_startup_launcher("daemon", "crosscopy.daemon")
+        launch_startup_entry("daemon")
+        what = "Windows login entry at %s" % launcher_path
     else:
-        die("Autostart is only supported on macOS and Linux. "
+        die("Autostart is only supported on macOS, Linux, and Windows. "
             "Use 'ccp daemon start' instead.")
 
     info = wait_for_ping(INSTALL_WAIT_SECS)
@@ -1653,8 +1784,16 @@ def cmd_daemon_uninstall():
             print("✅ Autostart removed (%s)." % unit_path)
         else:
             print("No autostart service was installed; nothing to remove.")
+    elif sys.platform == "win32":
+        from crosscopy.windows import remove_startup_launcher
+        removed = remove_startup_launcher("daemon")
+        stop_running_daemon()
+        if removed:
+            print("✅ Windows login entry removed.")
+        else:
+            print("No autostart service was installed; nothing to remove.")
     else:
-        print("Autostart is only supported on macOS and Linux; "
+        print("Autostart is only supported on macOS, Linux, and Windows; "
               "nothing to remove.")
 
 
@@ -1690,21 +1829,29 @@ def cmd_daemon(args):
             pid = int(pid) if pid else None
         except (TypeError, ValueError):
             pid = None
-        if pid and pid_alive(pid):
+        answering, orphan_pid = probe_orphan_daemon()
+        if (pid and pid_alive(pid)
+                and windows_daemon_pid_is_verified(
+                    pid, answering, orphan_pid,
+                    (info or {}).get("start_time"))):
             error = terminate_pid(pid)
             if error:
                 die(error)
+            remove_daemon_pidfile()
             print("✅ Daemon stopped (pid %d)." % pid)
             return
+        if pid and sys.platform == "win32":
+            # Do not taskkill a recycled PID solely on stale pidfile data.
+            remove_daemon_pidfile()
         # No usable pidfile — but the port may still be held by an
         # orphaned daemon (old install, lost/stale daemon.json). Ask it
         # for its pid via /api/status and stop it.
-        answering, orphan_pid = probe_orphan_daemon()
         if answering:
             if orphan_pid and pid_alive(orphan_pid):
                 error = terminate_pid(orphan_pid)
                 if error:
                     die(error)
+                remove_daemon_pidfile()
                 print("✅ Orphaned daemon stopped (pid %d, found via "
                       "/api/status)." % orphan_pid)
             else:
@@ -1719,10 +1866,7 @@ def cmd_daemon(args):
         else:
             print("Daemon is not running.")
         if info is not None:  # clear the stale pidfile either way
-            try:
-                os.remove(os.path.join(crosscopy_home(), "daemon.json"))
-            except OSError:
-                pass
+            remove_daemon_pidfile()
     elif action == "install":
         cmd_daemon_install()
     elif action == "uninstall":
@@ -1767,7 +1911,7 @@ def cmd_version(args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ccp",
-        description="cross-copy: a network file clipboard for Mac and Linux.",
+        description="cross-copy: a network clipboard for Windows, Mac, and Linux.",
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 

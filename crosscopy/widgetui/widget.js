@@ -93,7 +93,8 @@
   }
 
   function platformIcon(p) {
-    return p === "darwin" ? "🍎" : p === "linux" ? "🐧" : "💻";
+    return p === "darwin" ? "🍎" : p === "linux" ? "🐧" :
+      p === "win32" ? "🪟" : "💻";
   }
 
   function api(path, options) {

@@ -28,6 +28,7 @@ from flask import (Flask, Response, jsonify, request, send_file,
 from . import __version__, clipboard, config, offers
 from .events import bus
 from .offers import safe_rel_parts as _safe_rel_parts
+from .offers import plan_local_paths as _plan_local_paths
 from .offers import unique_path as _unique_path
 
 log = logging.getLogger("crosscopy.server")
@@ -584,14 +585,18 @@ def create_app(discovery=None, updater=None) -> Flask:
         written = []
         total_bytes = 0
         try:
-            for entry in manifest.get("files", []):
+            entries = manifest.get("files", [])
+            source_parts = []
+            for entry in entries:
                 parts = _safe_rel_parts(entry.get("rel_path", ""))
                 if parts is None:
                     raise RuntimeError("unsafe rel_path from peer: %r"
                                        % entry.get("rel_path"))
+                source_parts.append(parts)
+            planned = _plan_local_paths(source_parts, dest)
+            for entry, parts in zip(entries, planned):
                 target = dest.joinpath(*parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target = _unique_path(target)
                 resp = _peer_request(
                     peer, "GET", "/api/clipboard/file/%s/%d"
                     % (manifest["clipboard_id"], entry["index"]),

@@ -2,6 +2,7 @@ import os
 import plistlib
 import stat
 import sys
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -26,6 +27,7 @@ class MacOSAppTests(unittest.TestCase):
         self.assertEqual(0, icon.getpixel((0, 0))[3])
         self.assertGreater(icon.getpixel((512, 512))[3], 0)
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS bundle test")
     def test_widget_bundle_has_cross_copy_identity(self):
         with tempfile.TemporaryDirectory() as home:
             with mock.patch.object(cli, "crosscopy_home", return_value=home):
