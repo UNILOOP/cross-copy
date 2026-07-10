@@ -1,99 +1,50 @@
-# cross-copy
+# Cross Copy
 
-**A network clipboard for files *and text*, between your Windows, Mac, and Linux machines.**
+Cross Copy is a network clipboard for Windows, macOS, and Linux. It lets you
+copy files, folders, or text on one computer and paste them on another.
 
-`ccp copy` a file — or a snippet of text — on one machine, `ccp paste` on
-another — that's it. cross-copy discovers your machines automatically over mDNS
-and transfers everything directly between them over your LAN. No cloud, no
-account, no config: your data never leaves your network. Want to hand a file
-to one machine in particular? `ccp send` offers it AirDrop-style — nothing
-transfers until the other side accepts.
+Transfers happen directly over your local network. There is no cloud service,
+account, or remote storage involved.
 
-## 20-second demo
+## Before you install
 
-```console
-# On your Windows PC, Mac, or Linux box
-$ ccp copy notes.pdf
-Copied 1 file (2.4 MB) to the network clipboard.
+You need:
 
-# On another computer
-$ ccp paste
-Pasted notes.pdf (2.4 MB) from sayeed-macbook.
-```
+- Two or more computers on the same local network
+- Windows 10 or 11, a supported macOS release, or a modern desktop Linux
+  distribution
+- Python 3.9 or newer
 
-Text works exactly the same way:
+Cross Copy currently trusts the local network. It does not yet provide pairing,
+authentication, or encryption, so use it only on a network you trust. See
+[Security](#security) for details.
 
-```console
-# On your Mac
-$ ccp copy "meeting at 5"
-Copied text (12 chars) to the network clipboard.
+## Install Cross Copy
 
-# On your Linux box
-$ ccp paste
-meeting at 5
-```
-
-`ccp paste` prints text to stdout, so it pipes — and stdin works too:
-
-```sh
-cat log.txt | ccp copy      # copy a command's output as text
-ccp paste > out.txt         # paste it into a file on the other machine
-```
-
-Works with multiple files and whole directories too: `ccp copy photos/ report.docx`.
-
-## Send to a specific device (AirDrop-style) 📨
-
-The clipboard is a *pull* model — whoever pastes first gets it. `ccp send` is
-a *push*: you pick the target machine, and nothing transfers until someone
-there says yes.
-
-```console
-# On your Mac
-$ ccp send report.pdf --to linux-box
-📨 Offered 1 file (2.4 MB) to linux-box — waiting for them to accept...
-✅ linux-box accepted — 1 file delivered
-```
-
-```console
-# Meanwhile on linux-box, a desktop notification pops up:
-#   📥 sayeed-macbook wants to send 1 file (2.4 MB)
-$ ccp offers
-ID        FROM            CONTENTS        AGE
-3f9c1a2b  sayeed-macbook  1 file, 2.4 MB  4s
-
-Accept with: ccp accept [id] [dir]   ·   Decline with: ccp decline [id]
-
-$ ccp accept
-📥 Accepted 1 file (2.4 MB) from sayeed-macbook
-   /home/you/Downloads/cross-copy/report.pdf
-```
-
-Good to know:
-
-- `--to` takes a device name or id, and is **optional when there's exactly
-  one other device** on the network.
-- Text works too — `ccp send "the wifi password" --to macbook` — with the
-  same path-vs-text rules as `ccp copy` (`-t`/`--text` forces text, and piped
-  stdin works: `ccp send --to macbook < notes.txt`). Accepted text prints to
-  stdout, so it pipes.
-- Offers **expire after 5 minutes** if nobody answers (Ctrl-C while waiting
-  doesn't cancel the offer — it stays acceptable until it expires). The
-  sender is told whether you accepted or declined.
-- Accepted files land in `~/Downloads/cross-copy` by default — change that
-  with the `receive_dir` config key, or per-accept: `ccp accept [id] ~/dir`.
-
-## Install
+Install Cross Copy on every computer that you want to connect. The installer
+starts the background service automatically. In a graphical desktop session,
+it also enables the tray or menu-bar widget.
 
 ### Windows
 
-Open **PowerShell** (no administrator access required) and run:
+Administrator access is not required.
 
-```powershell
-irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.ps1 | iex
-```
+1. Open PowerShell.
+2. Run the installer:
 
-Or install from a cloned checkout:
+   ```powershell
+   irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.ps1 | iex
+   ```
+
+3. Open a new PowerShell window so the updated user PATH is available.
+4. If Windows Defender Firewall asks for permission, allow Cross Copy on
+   Private networks.
+
+The installer creates a dedicated environment in
+`%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and configures the
+daemon and notification-area widget to start when you sign in.
+
+To install from a cloned repository instead:
 
 ```powershell
 git clone https://github.com/UNILOOP/cross-copy.git
@@ -101,31 +52,18 @@ cd cross-copy
 .\install.ps1
 ```
 
-The Windows installer creates a dedicated environment under
-`%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and starts both the
-daemon and notification-area widget now and at login. Open a new PowerShell
-window after installation. If Windows Defender Firewall asks, allow Cross Copy
-on **Private networks** so your other LAN devices can connect.
-
-Use `.\install.ps1 -NoService` from a checkout to skip login autostart. To
-uninstall a one-line installation, run:
-
-```powershell
-irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/uninstall.ps1 | iex
-```
-
-From a checkout, use `.\uninstall.ps1`; add `-RemoveData` to also remove
-device configuration and logs.
+Use `.\install.ps1 -NoService` if you do not want Cross Copy to start at
+sign-in.
 
 ### macOS and Linux
 
-One-liner:
+Run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.sh | bash
 ```
 
-Or from source:
+To install from a cloned repository instead:
 
 ```sh
 git clone https://github.com/UNILOOP/cross-copy.git
@@ -133,182 +71,405 @@ cd cross-copy
 ./install.sh
 ```
 
-The macOS/Linux installer prefers [pipx](https://pipx.pypa.io) if you have it, otherwise it
-creates a self-contained venv and links `ccp` into `~/.local/bin`. It also
-enables daemon autostart at login **by default** (systemd user unit on Linux,
-launchd agent on macOS) — pass `--no-service` to skip that, and enable it later
-with `ccp daemon install`. To remove everything: `./uninstall.sh`.
+The installer uses `pipx` when it is available. Otherwise, it creates a
+self-contained virtual environment and links `ccp` into `~/.local/bin`.
 
-### Requirements
+The background daemon starts at login through launchd on macOS or a systemd
+user service on Linux. Use `./install.sh --no-service` to skip this step. You
+can enable it later with `ccp daemon install`.
 
-- Two or more machines on the **same LAN** (Windows, macOS, and/or Linux)
-- Windows 10/11, a supported macOS release, or a modern desktop Linux distribution
-- Python **3.9+**
-- That's it — the daemon auto-starts on first use
+### Confirm the installation
 
-## Commands
+On each computer, run:
 
-| Command | What it does |
-|---|---|
-| `ccp copy <path...\|text>` | Put files/dirs on the network clipboard (stays valid for repeated pastes). If no argument is an existing path, the arguments are copied as **text**; `--text`/`-t` forces text. `echo foo \| ccp copy` copies stdin |
-| `ccp move <path...>` | Like copy, but source files are deleted after a successful paste (a text move clears the source clipboard) |
-| `ccp paste [dir]` | Paste the newest peer clipboard into `dir` (default: current dir); a **text** clipboard is printed verbatim to stdout instead (pipeable: `ccp paste > out.txt`). `--from <name\|id>` to pick a machine |
-| `ccp send <path...\|text> --to <name\|id>` | Offer files or text to **one specific device** and wait for them to accept (AirDrop-style). Same path-vs-text rules as `ccp copy`; `--to` is optional when there's exactly one other device |
-| `ccp offers` | List pending incoming offers (id, sender, contents, age) |
-| `ccp accept [id] [dir]` | Accept an offer — newest one if no id (a short id prefix is enough). Text prints to stdout; files go to `dir`, or your `receive_dir` if omitted |
-| `ccp decline [id]` | Decline an offer (newest if no id) — the sender is notified |
-| `ccp devices` | List machines on the LAN with their clipboard contents (alias: `ccp list`) |
-| `ccp status` | Show daemon status and your current local clipboard |
-| `ccp clear` | Clear your local clipboard |
-| `ccp add <host> [port]` | Manually add a peer by IP (when mDNS doesn't work) |
-| `ccp name <newname>` | Rename this device (defaults to hostname) |
-| `ccp daemon run\|start\|stop\|status` | Manage the background daemon directly |
-| `ccp daemon install` | Set up start-at-login (Windows user login entry / systemd user unit / launchd agent) and start the daemon now. The platform installer runs this by default |
-| `ccp daemon uninstall` | Stop, disable, and remove the start-at-login service |
-| `ccp ui` | Open the web UI in your browser |
-| `ccp widget` | Run the menu-bar / system-tray companion in the foreground (see below) |
-| `ccp widget install\|uninstall` | Start the tray widget now **and at every login** / remove that. `install.sh` runs `install` by default in graphical sessions |
-| `ccp update` | Update cross-copy to the latest version (and restart the daemon) |
-| `ccp update --check` | Only check whether a newer version is available |
-| `ccp version` | Print the version |
+```sh
+ccp status
+ccp devices
+```
 
-## Updates
+`ccp status` confirms that the local daemon is running. After Cross Copy is
+installed on another computer, `ccp devices` should list it. Device discovery
+can take a few seconds.
 
-cross-copy keeps itself up to date **by default**: the daemon checks for a new
-version shortly after it starts and every 6 hours, installs it, and restarts
-itself. You don't have to do anything.
+## Make your first transfer
 
-- **Turn auto-update off** by setting `"auto_update": false` in
-  `~/.crosscopy/config.json`. You'll still see an update notice in `ccp status`
-  and the web UI when a new version is out.
-- **Update manually** any time with `ccp update` (or just see what's out there
-  with `ccp update --check`).
+### Copy a file
 
-## Configuration
+On the computer that has the file:
 
-Everything lives in `~/.crosscopy/config.json` (created on first run; edit
-and restart the daemon to apply):
+```sh
+ccp copy notes.pdf
+```
 
-| Key | Default | What it does |
-|---|---|---|
-| `device_name` | your hostname | How this machine appears to others — or just run `ccp name <newname>` |
-| `receive_dir` | `~/Downloads/cross-copy` | Where files from **accepted offers** (`ccp send` → `ccp accept`) are saved; `~` is expanded. Override per-accept with `ccp accept [id] <dir>` |
-| `notifications` | `true` | Desktop notifications (Windows banners, macOS Notification Center, `notify-send`/D-Bus on Linux) for incoming offers, declines, and finished transfers. Set to `false` to silence them |
-| `auto_update` | `true` | Let the daemon update itself automatically (see [Updates](#updates)) |
+On another computer:
 
-## Web UI 🖱️
+```sh
+ccp paste
+```
+
+Files are saved in the current directory unless you provide another one:
+
+```sh
+ccp paste received-files
+```
+
+You can copy several files or an entire folder in one command:
+
+```sh
+ccp copy photos/ report.docx notes.txt
+```
+
+The clipboard remains available for repeated pastes until you replace or clear
+it.
+
+### Copy text
+
+Use `--text` when you want to be explicit:
+
+```sh
+ccp copy --text "meeting at 5"
+```
+
+On another computer:
+
+```sh
+ccp paste
+```
+
+Text is written to standard output, so it works naturally with pipes and file
+redirection:
+
+```sh
+cat log.txt | ccp copy
+ccp paste > received-log.txt
+```
+
+If none of the arguments passed to `ccp copy` is an existing path, Cross Copy
+treats the arguments as text. Using `--text` avoids ambiguity.
+
+### Move files instead of copying them
+
+`ccp move` works like `ccp copy`, but removes the source files after another
+computer completes a successful paste:
+
+```sh
+ccp move archive.zip
+```
+
+Source files are not removed if the transfer fails.
+
+## Send to a specific computer
+
+The regular clipboard is available to any connected computer. When you want
+one particular computer to receive something, use `ccp send`.
+
+On the sending computer:
+
+```sh
+ccp send report.pdf --to office-pc
+```
+
+On the receiving computer:
+
+```sh
+ccp offers
+ccp accept
+```
+
+Use `ccp decline` to reject the offer. If several offers are waiting, pass the
+offer ID shown by `ccp offers`:
+
+```sh
+ccp accept 3f9c1a2b ~/Documents
+ccp decline 712bc890
+```
+
+Important behavior:
+
+- `--to` accepts a device name or ID. It can be omitted when exactly one other
+  device is available.
+- Text can be sent with `ccp send --text "message" --to office-pc`.
+- Offers expire after five minutes.
+- Accepted files go to `~/Downloads/cross-copy` by default.
+- Accepted text is printed to standard output.
+
+## Use the graphical interface
+
+The command-line interface and graphical tools use the same daemon and network
+clipboard. You can use either at any time.
+
+### Web interface
+
+Run:
 
 ```sh
 ccp ui
 ```
 
-Opens `http://localhost:7373` — see every device on your network and what each
-one is sharing, live: the page updates the moment something changes, no
-refreshing needed. **Drag & drop** files into the browser to share them from
-this device without touching the terminal, or use **"Share text"** to share a
-snippet. On the other machine, hit **"Save to this device"** to receive files
-(pick the folder with "Save into folder") or **"Get text"** to grab shared text
-— it lands right there and goes onto the browser clipboard as well. Done
-sharing? Hit **"Stop sharing"**.
+This opens `http://localhost:7373` in your browser. From there you can:
 
-### Tray widget
+- See connected computers and their shared clipboard contents
+- Share files by dragging them into the page
+- Share text
+- Save files from another computer
+- Copy received text to the browser clipboard
+- Stop sharing the current clipboard
+
+The page updates automatically when devices, clipboards, or offers change.
+
+### Tray or menu-bar widget
+
+The platform installer enables the widget automatically in graphical desktop
+sessions. To manage it yourself, use:
 
 ```sh
-ccp widget install   # start now + at every login (install.sh does this by default)
-ccp widget           # or run it in the foreground once
+ccp widget install
+ccp widget uninstall
+ccp widget
 ```
 
-Puts cross-copy in your **notification area (Windows) / menu bar (macOS) /
-system tray (Linux)**: send
-files or your clipboard text to any device in a couple of clicks, and accept
-or decline incoming offers without opening a terminal. **"Open panel"** pops
-a compact panel with the same controls, live-updating — a **native floating
-window** on macOS (WKWebView), and a compact Edge/Chrome app window on Windows
-and Linux. Remove the autostart with `ccp widget uninstall`.
+`ccp widget install` starts the widget now and at login. `ccp widget` runs it
+in the foreground, which is also useful when diagnosing startup problems.
 
-On Windows, Python's standard Tcl/Tk option supplies the file picker,
-clipboard integration, and interactive notification cards. It is enabled by
-default in the official Python installer. Incoming offers have real
-**Accept/Decline** buttons; accepted text is placed on the Windows clipboard,
-and files are saved to `Downloads\cross-copy` by default.
+The widget appears in the Windows notification area, the macOS menu bar, or
+the Linux system tray. It can send files or text, show pending offers, and
+accept or decline incoming transfers. Cross Copy remains a background
+application and does not appear in the macOS Dock.
 
-> **Ubuntu/GNOME note:** tray icons render through AppIndicator — the
-> installer builds its venv with `--system-site-packages` so the widget can
-> use the system's PyGObject. If the icon doesn't appear, check that the
-> "Ubuntu AppIndicators" GNOME extension is enabled and
-> `gir1.2-ayatanaappindicator3-0.1` is installed.
+On Windows, the official Python installer includes Tcl/Tk, which Cross Copy
+uses for file selection, clipboard access, and interactive offer cards.
 
-The widget needs two optional dependencies (`pystray` and `Pillow`) —
-`install.sh` includes them by default; for manual installs they're the
-`widget` extra:
+On Ubuntu and other GNOME desktops, tray support uses AppIndicator. If the
+icon does not appear, make sure the Ubuntu AppIndicators extension is enabled
+and `gir1.2-ayatanaappindicator3-0.1` is installed.
+
+For a manual Python installation, install the widget dependencies with:
 
 ```sh
 pip install "cross-copy[widget]"
-# pipx users:
-pipx install cross-copy && pipx inject cross-copy pystray Pillow
 ```
 
-Desktop notifications don't need the extra: on Windows, macOS, and Linux the daemon
-fires them natively whenever an offer arrives, is declined, or a transfer
-finishes.
+For a manual `pipx` installation:
 
-## How it works
+```sh
+pipx install cross-copy
+pipx inject cross-copy pystray Pillow
+```
 
-- Each machine runs a small daemon (started at login by the installer, and
-  auto-started on first use otherwise) that announces itself via mDNS as
-  `_crosscopy._tcp`, so machines find each other with zero config.
-- `ccp copy` just records a manifest — nothing is transferred yet. `ccp paste`
-  finds the newest clipboard on the network and downloads the files (or fetches
-  the text) **directly from the source machine over HTTP**. Nothing ever leaves
-  your LAN.
-- `ccp move` is safe: the source files are only deleted after the receiving
-  machine confirms a fully successful paste.
-- `ccp send` works the other way around: the sender posts an *offer* (just
-  metadata) to the target, and accepting it pulls the files straight from the
-  sender — nothing is transferred until then, and unanswered offers expire
-  after 5 minutes.
+## Command reference
+
+### Clipboard commands
+
+| Command | Purpose |
+|---|---|
+| `ccp copy <paths...>` | Share files or folders on the network clipboard |
+| `ccp copy --text <text>` | Share text on the network clipboard |
+| `ccp move <paths...>` | Share files and remove them after a successful paste |
+| `ccp paste [directory]` | Paste the newest clipboard from another computer |
+| `ccp paste --from <name-or-id>` | Paste from a specific computer |
+| `ccp clear` | Clear this computer's shared clipboard |
+
+### Direct-send commands
+
+| Command | Purpose |
+|---|---|
+| `ccp send <paths...> --to <device>` | Offer files to one computer |
+| `ccp send --text <text> --to <device>` | Offer text to one computer |
+| `ccp offers` | List incoming offers |
+| `ccp accept [id] [directory]` | Accept an offer |
+| `ccp decline [id]` | Decline an offer |
+
+### Device and application commands
+
+| Command | Purpose |
+|---|---|
+| `ccp devices` | List connected computers and their clipboard contents |
+| `ccp add <host> [port]` | Add a computer manually by IP address |
+| `ccp name <new-name>` | Change how this computer appears to others |
+| `ccp status` | Show daemon, update, and local clipboard status |
+| `ccp ui` | Open the web interface |
+| `ccp widget` | Run the tray or menu-bar widget in the foreground |
+| `ccp widget install` | Start the widget now and at login |
+| `ccp widget uninstall` | Stop the widget and remove it from login startup |
+| `ccp daemon start` | Start the background daemon |
+| `ccp daemon stop` | Stop the background daemon |
+| `ccp daemon status` | Show daemon status |
+| `ccp daemon install` | Start the daemon now and at login |
+| `ccp daemon uninstall` | Stop the daemon and remove it from login startup |
+| `ccp update` | Install the latest version and restart Cross Copy |
+| `ccp update --check` | Check for a newer version without installing it |
+| `ccp version` | Print the installed version |
+
+`ccp list` is an alias for `ccp devices`.
+
+## Configuration
+
+Cross Copy creates its configuration file on first use:
+
+- Windows: `%USERPROFILE%\.crosscopy\config.json`
+- macOS and Linux: `~/.crosscopy/config.json`
+
+Restart the daemon after editing the file:
+
+```sh
+ccp daemon stop
+ccp daemon start
+```
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `device_name` | Computer hostname | Name shown to other computers |
+| `receive_dir` | `~/Downloads/cross-copy` | Destination for accepted file offers |
+| `notifications` | `true` | Show notifications for offers and completed transfers |
+| `auto_update` | `true` | Install new Cross Copy versions automatically |
+
+You can change the device name without editing the file:
+
+```sh
+ccp name office-pc
+```
+
+The `CROSSCOPY_HOME` environment variable changes the data directory, and
+`CROSSCOPY_PORT` changes the default TCP port from `7373`.
+
+## Updates
+
+Automatic updates are enabled by default. The daemon checks shortly after it
+starts and then every six hours. When an update is installed, the daemon and
+running widget restart with the new version.
+
+To update manually:
+
+```sh
+ccp update
+```
+
+To check without installing:
+
+```sh
+ccp update --check
+```
+
+Set `"auto_update": false` in the configuration file to disable automatic
+installation. Update availability will still appear in `ccp status` and the
+web interface.
+
+## How Cross Copy works
+
+Each computer runs a small background daemon. The daemons advertise themselves
+over mDNS as `_crosscopy._tcp` and communicate directly over HTTP on the local
+network.
+
+When you run `ccp copy`, Cross Copy records a clipboard manifest. Files are not
+transferred until another computer runs `ccp paste`. The receiving computer
+then downloads the files directly from the source.
+
+`ccp send` sends only an offer first. The receiving computer pulls the content
+from the sender after the offer is accepted.
+
+For `ccp move`, the source files are deleted only after the receiving computer
+confirms that the complete transfer succeeded.
 
 ## Troubleshooting
 
-- **A device doesn't show up in `ccp devices`** — some networks (corporate
-  Wi-Fi, VLANs, some routers) block mDNS. Add the peer manually by IP:
-  `ccp add 192.168.1.5`.
-- **One-way visibility** (machine A sees B, but B doesn't see A) — as of v0.3
-  this self-heals: machines that can reach each other introduce themselves
-  directly, so as long as *either* machine can reach the other, both show up
-  within about a minute. If neither direction works, fall back to
-  `ccp add <ip>` on one side.
-- **Devices see each other but transfers fail** — a firewall is likely blocking
-  the daemon port. Open **TCP 7373** (or your `CROSSCOPY_PORT`) on both
-  machines. On Windows, make sure the network is marked **Private** and allow
-  Python/Cross Copy through Windows Defender Firewall on Private networks.
-- **The Windows tray icon is missing** — run `ccp widget` in PowerShell to see
-  the startup error. The official Python installer includes Tcl/Tk; if you used
-  a custom Python distribution, reinstall with Tcl/Tk enabled and run
-  `ccp widget install` again.
-- **Want to try it on a single machine?** Run two instances side by side:
+### A computer does not appear in `ccp devices`
 
-  ```sh
-  # Terminal 1
-  CROSSCOPY_HOME=/tmp/a CROSSCOPY_PORT=7373 CROSSCOPY_NO_MDNS=1 ccp daemon run
-  # Terminal 2
-  CROSSCOPY_HOME=/tmp/b CROSSCOPY_PORT=7474 CROSSCOPY_NO_MDNS=1 ccp daemon run
-  # Terminal 3 — wire them together and use them
-  CROSSCOPY_HOME=/tmp/b CROSSCOPY_PORT=7474 ccp add 127.0.0.1 7373
-  ```
+Some corporate networks, VLANs, and routers block mDNS. Add the computer by IP
+address:
 
-## ⚠️ Security
+```sh
+ccp add 192.168.1.5
+```
 
-**v0.5.0 trusts your LAN.** There is no authentication or encryption yet: any
-device on your network can read your cross-copy clipboard (files *and* text)
-and offer you files.
-Use it on networks you trust (home, small office) — **not** on public or
-untrusted Wi-Fi. Pairing codes and TLS are on the roadmap.
+If one computer can discover the other, Cross Copy normally restores
+two-direction visibility within about a minute.
+
+### Computers appear, but transfers fail
+
+A firewall is probably blocking TCP port `7373`. Allow that port, or the port
+set through `CROSSCOPY_PORT`, on both computers.
+
+On Windows, confirm that the network is marked Private and that Windows
+Defender Firewall allows Python or Cross Copy on Private networks.
+
+### The Windows notification-area icon is missing
+
+Run the widget in PowerShell to see its startup error:
+
+```powershell
+ccp widget
+```
+
+If Python was installed from a custom distribution, make sure it includes
+Tcl/Tk. After correcting the Python installation, run `ccp widget install`
+again.
+
+### The Linux tray icon is missing
+
+Run `ccp widget` in a terminal. On GNOME, verify that AppIndicator support is
+installed and enabled.
+
+### Test two instances on one computer
+
+Use separate data directories and ports:
+
+```sh
+# Terminal 1
+CROSSCOPY_HOME=/tmp/cross-copy-a CROSSCOPY_PORT=7373 CROSSCOPY_NO_MDNS=1 ccp daemon run
+
+# Terminal 2
+CROSSCOPY_HOME=/tmp/cross-copy-b CROSSCOPY_PORT=7474 CROSSCOPY_NO_MDNS=1 ccp daemon run
+
+# Terminal 3
+CROSSCOPY_HOME=/tmp/cross-copy-b CROSSCOPY_PORT=7474 ccp add 127.0.0.1 7373
+```
+
+## Uninstall
+
+### Windows
+
+For an installation made with the one-line command:
+
+```powershell
+irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/uninstall.ps1 | iex
+```
+
+From a cloned repository:
+
+```powershell
+.\uninstall.ps1
+```
+
+Add `-RemoveData` to remove the device configuration, clipboard state, and
+logs as well:
+
+```powershell
+.\uninstall.ps1 -RemoveData
+```
+
+### macOS and Linux
+
+From the cloned repository, run:
+
+```sh
+./uninstall.sh
+```
+
+The script asks whether it should also remove your Cross Copy data.
+
+## Security
+
+Cross Copy version 0.5.0 uses a trusted-LAN model. It does not currently
+authenticate devices or encrypt transfers. Any device that can reach the
+Cross Copy daemon on your network may be able to read the shared clipboard or
+send offers.
+
+Use Cross Copy on home, small-office, or other trusted private networks. Do
+not use it on public or untrusted Wi-Fi. Pairing and encrypted transport are
+planned for a future release.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Cross Copy is available under the [MIT License](LICENSE).
 
----
-
-<p align="center">An open source initiative by <a href="https://uniloop.com">UNILOOP LLC</a></p>
+Cross Copy is an open source project by [UNILOOP LLC](https://uniloop.com).
