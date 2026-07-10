@@ -5,6 +5,7 @@ pystray + Pillow are an optional extra (`cross-copy[widget]`); everything
 else is stdlib + requests. Talks only to the *local* daemon.
 """
 
+import http.client
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ import sys
 import threading
 import time
 import webbrowser
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -213,6 +215,83 @@ def api_post(path, body=None, timeout=30):
         return r.ok, payload
     except requests.RequestException as e:
         return False, {"error": str(e)}
+
+
+def api_post_files(path, peer_id, paths, timeout=3600):
+    """Upload picker-selected files from the widget process.
+
+    On macOS this process owns the NSOpenPanel access grant; sending only the
+    absolute paths to the background daemon loses that grant for protected
+    folders such as Downloads and Desktop.
+    """
+    handles = []
+    connection = None
+    try:
+        boundary = "----CrossCopy%s" % os.urandom(12).hex()
+        peer_part = (
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"peer_id\"\r\n\r\n"
+            "%s\r\n" % (boundary, peer_id)).encode("utf-8")
+        parts = []
+        total = len(peer_part)
+        for selected in paths:
+            handle = open(selected, "rb")
+            handles.append(handle)
+            filename = os.path.basename(selected).replace("\r", "_").replace(
+                "\n", "_")
+            fallback = filename.encode("ascii", "replace").decode("ascii")
+            fallback = fallback.replace("\\", "_").replace('"', "_")
+            header = (
+                "--%s\r\n"
+                "Content-Disposition: form-data; name=\"files\"; "
+                "filename=\"%s\"; filename*=UTF-8''%s\r\n"
+                "Content-Type: application/octet-stream\r\n\r\n"
+                % (boundary, fallback, quote(filename, safe=""))).encode("ascii")
+            size = os.fstat(handle.fileno()).st_size
+            parts.append((header, handle))
+            total += len(header) + size + 2  # trailing CRLF
+        closing = ("--%s--\r\n" % boundary).encode("ascii")
+        total += len(closing)
+
+        target = urlsplit(base_url() + path)
+        connection = http.client.HTTPConnection(
+            target.hostname, target.port, timeout=timeout)
+        connection.putrequest("POST", target.path or "/")
+        connection.putheader("Content-Type",
+                             "multipart/form-data; boundary=%s" % boundary)
+        connection.putheader("Content-Length", str(total))
+        connection.endheaders()
+        connection.send(peer_part)
+        for header, handle in parts:
+            connection.send(header)
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                connection.send(chunk)
+            connection.send(b"\r\n")
+        connection.send(closing)
+
+        response = connection.getresponse()
+        raw = response.read()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeError, ValueError):
+            payload = {}
+        return 200 <= response.status < 400, payload
+    except (OSError, http.client.HTTPException) as exc:
+        return False, {"error": str(exc)}
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        for handle in handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
 
 
 def format_size(total):
@@ -461,9 +540,8 @@ class WidgetApp(object):
             return  # dialog cancelled
 
         def work():
-            ok, res = api_post("/api/send",
-                               {"peer_id": peer["id"], "paths": paths},
-                               timeout=3600)
+            ok, res = api_post_files("/api/send", peer["id"], paths,
+                                     timeout=3600)
             if not ok:
                 notify("Cross Copy", "Send failed: %s"
                        % (res.get("error") or "daemon error"))

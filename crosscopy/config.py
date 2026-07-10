@@ -6,7 +6,8 @@ Everything lives under ~/.crosscopy/ (override with CROSSCOPY_HOME):
                  ~/Downloads/cross-copy), notifications flag (default true)
   daemon.json    running daemon identity: pid, port, and Windows start_time
   daemon.log     daemon output (written by the CLI's daemon-start redirect)
-  staging/       files uploaded through the web UI
+  staging/       files shared with every device through the web UI
+  offer-staging/ files uploaded for a targeted offer while it is active
   clipboard.json current clipboard manifest
 """
 
@@ -50,6 +51,12 @@ def daemon_log_path() -> Path:
 
 def staging_dir() -> Path:
     path = get_home() / "staging"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def offer_staging_dir() -> Path:
+    path = get_home() / "offer-staging"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

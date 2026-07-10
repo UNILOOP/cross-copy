@@ -465,6 +465,30 @@
     });
   }
 
+  function doSendFiles(peer, fileInput, btn) {
+    if (!fileInput.files.length) return;
+    var form = new FormData();
+    form.append("peer_id", peer.id);
+    Array.prototype.forEach.call(fileInput.files, function (file) {
+      form.append("files", file, file.name);
+    });
+    btn.classList.add("disabled");
+    fileInput.disabled = true;
+    setSendStatus(peer.id, "uploading…");
+    api("/api/send", { method: "POST", body: form }).then(function (offer) {
+      setSendStatus(peer.id, "waiting for accept…");
+      if (offer.offer_id) watchSend(offer.offer_id, peer.id);
+    }).catch(function (err) {
+      setSendStatus(peer.id, "failed", "bad");
+      toast("Could not send files to " + (peer.name || "peer") + ": " +
+        err.message, "error");
+    }).then(function () {
+      fileInput.value = "";
+      fileInput.disabled = false;
+      btn.classList.remove("disabled");
+    });
+  }
+
   /* ---------- peers ---------- */
 
   function buildSendBlock(peer) {
@@ -507,17 +531,24 @@
     });
     row.appendChild(input);
     row.appendChild(sendBtn);
+
+    var fileBtn = el("label", "btn file-btn", "Send files");
+    fileBtn.title = "Choose files to send only to " +
+      (peer.name || "this device");
+    var fileInput = el("input");
+    fileInput.type = "file";
+    fileInput.multiple = true;
+    fileInput.setAttribute("aria-label", fileBtn.title);
+    fileInput.addEventListener("change", function () {
+      doSendFiles(peer, fileInput, fileBtn);
+    });
+    fileBtn.appendChild(fileInput);
+    row.appendChild(fileBtn);
     block.appendChild(row);
 
-    // Honest capability note: the browser can't hand local file *paths* to
-    // /api/send, so targeted file sends live in the widget / CLI for now.
     var hint = el("p", "send-hint");
-    hint.appendChild(document.createTextNode(
-      "Text goes straight to this device (they accept first). To send files " +
-      "to just this device, use the tray widget or "));
-    hint.appendChild(el("code", null, "ccp send"));
-    hint.appendChild(document.createTextNode(
-      " — drag & drop above shares with everyone."));
+    hint.textContent = "Text and files are offered only to this device; " +
+      "the recipient accepts before transfer.";
     block.appendChild(hint);
 
     return block;

@@ -33,6 +33,7 @@ notifications fire on: incoming offer (receiver), declined/completed/failed
 
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -203,7 +204,8 @@ def plan_local_paths(paths, dest: Path, platform=None):
 def wire_offer(offer: dict) -> dict:
     """The offer as POSTed to the peer: no status, no local-only keys."""
     pub = {k: v for k, v in offer.items()
-           if k not in ("status", "to", "sender_host", "last_activity")}
+           if k not in ("status", "to", "sender_host", "last_activity",
+                        "staging_dir")}
     if offer.get("kind") == "files":
         pub["files"] = [{k: v for k, v in f.items()
                          if k not in ("source_path", "mtime_ns")}
@@ -215,7 +217,7 @@ def public_offer(offer: dict) -> dict:
     """The offer as returned by the local API: status kept, internals
     (source_path, sender_host) stripped."""
     pub = {k: v for k, v in offer.items()
-           if k not in ("sender_host", "last_activity")}
+           if k not in ("sender_host", "last_activity", "staging_dir")}
     if offer.get("kind") == "files":
         pub["files"] = [{k: v for k, v in f.items()
                          if k not in ("source_path", "mtime_ns")}
@@ -259,7 +261,8 @@ class OffersManager:
 
     # -- construction --------------------------------------------------------
 
-    def create_outgoing(self, peer: dict, paths=None, text=None) -> dict:
+    def create_outgoing(self, peer: dict, paths=None, text=None,
+                        staging_dir=None) -> dict:
         """Build and store a pending outgoing offer for `peer`. Directory
         expansion reuses clipboard.build_manifest; raises ValueError on bad
         input (missing paths, empty file set, oversized text, both/neither)."""
@@ -294,6 +297,8 @@ class OffersManager:
                 for f in manifest["files"]
             ]
             offer["total_size"] = manifest["total_size"]
+            if staging_dir is not None:
+                offer["staging_dir"] = str(staging_dir)
         with self._lock:
             self._prune_locked()  # creation publishes below anyway
             self._outgoing[offer["offer_id"]] = offer
@@ -352,6 +357,7 @@ class OffersManager:
         with self._lock:
             removed = self._outgoing.pop(offer_id, None)
         if removed is not None:
+            self._cleanup_staging(removed)
             bus.publish("offers")
 
     # -- state transitions ----------------------------------------------------
@@ -401,7 +407,32 @@ class OffersManager:
             bus.publish("offers")
         if changed:
             log.info("offer %s -> %s (%s)", offer_id, status, summarize(offer))
+            if status in TERMINAL_STATES:
+                self._cleanup_staging(offer)
         return changed, offer
+
+    @staticmethod
+    def _cleanup_staging(offer: dict) -> None:
+        """Remove daemon-owned files for a completed/abandoned upload.
+
+        Only direct children of offer-staging are eligible. This guard keeps
+        a malformed or accidentally reused local-only path from deleting an
+        arbitrary directory.
+        """
+        raw = offer.get("staging_dir")
+        if not raw:
+            return
+        try:
+            root = config.offer_staging_dir().resolve()
+            target = Path(raw).resolve()
+            if target.parent != root:
+                log.warning("refusing to clean unsafe offer staging path %s",
+                            target)
+                return
+            shutil.rmtree(target, ignore_errors=True)
+        except OSError as exc:
+            log.warning("could not clean offer staging directory %s: %s",
+                        raw, exc)
 
     # -- expiry ----------------------------------------------------------------
 
@@ -423,6 +454,7 @@ class OffersManager:
                         expired += 1
                         log.info("offer %s expired (%s)", oid,
                                  summarize(offer))
+                    self._cleanup_staging(offer)
                     del table[oid]
         return expired
 

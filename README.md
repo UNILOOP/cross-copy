@@ -262,6 +262,7 @@ This opens `http://localhost:7373` in your browser. From there you can:
 - See connected computers and their shared clipboard contents
 - Share files by dragging them into the page
 - Share text
+- Send selected files or text directly to one particular computer
 - Save files from another computer
 - Copy received text to the browser clipboard
 - Stop sharing the current clipboard
@@ -559,7 +560,7 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.6.2 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.6.3 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
 send offers. Recovery details and controls, including destination paths and

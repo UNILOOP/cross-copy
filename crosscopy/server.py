@@ -17,6 +17,7 @@ import ipaddress
 import logging
 import os
 import queue
+import shutil
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -978,14 +979,28 @@ def create_app(discovery=None, updater=None) -> Flask:
 
     @app.post("/api/send")
     def api_send():
-        """Build an outgoing offer and push it at the chosen peer."""
-        body = request.get_json(silent=True) or {}
-        peer_id = str(body.get("peer_id") or "").strip()
-        paths = body.get("paths")
-        text = body.get("text")
+        """Build an outgoing offer and push it at the chosen peer.
+
+        JSON accepts daemon-readable paths or text. Multipart accepts actual
+        file bytes, which is required for browsers and for macOS native
+        pickers whose protected-folder access is scoped to the widget process.
+        """
+        uploads = [u for u in request.files.getlist("files")
+                   if u and u.filename]
+        if request.files or request.form:
+            peer_id = str(request.form.get("peer_id") or "").strip()
+            paths = None
+            text = None
+        else:
+            body = request.get_json(silent=True) or {}
+            peer_id = str(body.get("peer_id") or "").strip()
+            paths = body.get("paths")
+            text = body.get("text")
         if not peer_id:
             return _error("missing 'peer_id'", 400)
-        if (paths is None) == (text is None):
+        if uploads and (paths is not None or text is not None):
+            return _error("give either uploaded files, 'paths', or 'text'", 400)
+        if not uploads and (paths is None) == (text is None):
             return _error("give either 'paths' or 'text', not both", 400)
         if paths is not None and (not isinstance(paths, list) or not paths):
             return _error("'paths' must be a non-empty list", 400)
@@ -996,10 +1011,44 @@ def create_app(discovery=None, updater=None) -> Flask:
             return _error("peer not found: %s" % peer_id, 404)
         peer = matches[0]
 
+        stage = None
+        if uploads:
+            stage = config.offer_staging_dir() / str(uuid.uuid4())
+            stage.mkdir(parents=True, exist_ok=True)
+            paths = []
+            try:
+                for upload in uploads:
+                    name = os.path.basename(
+                        upload.filename.replace("\\", "/")) or "upload"
+                    target = _unique_path(stage / name)
+                    upload.save(str(target))
+                    paths.append(str(target))
+            except Exception as exc:
+                shutil.rmtree(stage, ignore_errors=True)
+                return _error("upload failed: %s" % _friendly_error(exc), 500)
+
         try:
-            offer = offers.manager.create_outgoing(peer, paths=paths, text=text)
+            offer = offers.manager.create_outgoing(
+                peer, paths=paths, text=text, staging_dir=stage)
         except ValueError as exc:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
             return _error(str(exc), 400)
+        except PermissionError as exc:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
+            log.warning("cannot read file selected for %s: %s",
+                        peer.get("name"), exc)
+            return _error(
+                "Cross Copy cannot read a selected file. Choose it through "
+                "the widget or grant Cross Copy access to that folder.", 403)
+        except OSError as exc:
+            if stage is not None:
+                shutil.rmtree(stage, ignore_errors=True)
+            log.warning("cannot prepare offer for %s: %s",
+                        peer.get("name"), exc)
+            return _error("could not read a selected file: %s"
+                          % _friendly_error(exc), 400)
 
         try:
             resp = _peer_request(peer, "POST", "/api/offer",

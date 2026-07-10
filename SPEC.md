@@ -192,9 +192,15 @@ Expired/terminal offers are pruned.
 All offer state is in-memory in the daemon (lost on restart — fine).
 
 Sender local API:
-- `POST /api/send` body `{"peer_id", "paths": [...] XOR "text": "..."}` → builds outgoing
-  offer (dir expansion like /api/copy), POSTs it to the target's `/api/offer`, returns the
-  offer object (status pending). 404 unknown peer, 502 target unreachable, 400 bad body.
+- `POST /api/send` accepts JSON `{"peer_id", "paths": [...] XOR "text": "..."}` or a
+  multipart form with `peer_id` and repeatable `files` fields. Multipart files are copied into
+  daemon-owned offer staging so native pickers can send files from OS-protected folders and
+  browsers can send bytes without exposing local paths. The staging directory remains while
+  an offer is pending/accepted for resumability and is removed when it completes, fails,
+  is declined, expires, or cannot reach the peer. Builds the outgoing offer (directory
+  expansion like /api/copy for JSON paths), POSTs it to the target's `/api/offer`, and returns
+  the offer object (status pending). 404 unknown peer, 502 target unreachable, 403 unreadable
+  JSON path, 400 bad body.
 - `GET /api/send/<offer_id>` → current outgoing offer object (404 unknown/pruned).
 
 Peer-facing (both directions):

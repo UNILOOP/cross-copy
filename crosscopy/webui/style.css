@@ -605,7 +605,22 @@ input:focus, textarea:focus {
   overflow-y: auto;
 }
 
+.file-btn { white-space: nowrap; cursor: pointer; }
+.file-btn input[type="file"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.file-btn.disabled { opacity: 0.55; cursor: wait; }
+
 .send-hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+@media (max-width: 620px) {
+  .send-row { flex-wrap: wrap; }
+  .send-row .send-input { flex-basis: 100%; }
+}
 
 /* ---------- add device form ---------- */
 
