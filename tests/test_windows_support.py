@@ -172,10 +172,10 @@ class WindowsSupportTests(unittest.TestCase):
         with mock.patch.object(windows.sys, "platform", "win32"), \
                 mock.patch.dict(sys.modules, {"winreg": winreg}):
             windows.refresh_registered_startup_commands(
-                r"C:\App\Cross Copy 0.5.2.exe")
+                r"C:\App\Cross Copy %s.exe" % __version__)
         winreg.SetValueEx.assert_called_once()
         command = winreg.SetValueEx.call_args.args[-1]
-        self.assertIn("Cross Copy 0.5.2.exe", command)
+        self.assertIn("Cross Copy %s.exe" % __version__, command)
         self.assertIn("Cross Copy Daemon.pyw", command)
 
     def test_windows_background_process_uses_no_console(self):
@@ -451,11 +451,13 @@ class WindowsSupportTests(unittest.TestCase):
         original_state = dict(daemon._cleanup_state)
         daemon._cleanup_state.update(
             {"done": False, "discovery": None, "updater": None})
-        launcher = r"C:\App\Cross Copy 0.5.3.exe"
+        major, minor, patch = (int(part) for part in __version__.split("."))
+        updated_version = "%d.%d.%d" % (major, minor, patch + 1)
+        launcher = r"C:\App\Cross Copy %s.exe" % updated_version
         try:
             with mock.patch.object(daemon.sys, "platform", "win32"), \
                     mock.patch("importlib.metadata.version",
-                               return_value="0.5.3"), \
+                               return_value=updated_version), \
                     mock.patch("crosscopy.windows.make_windows_launcher",
                                return_value=launcher) as make_launcher, \
                     mock.patch(
@@ -469,7 +471,7 @@ class WindowsSupportTests(unittest.TestCase):
                                       side_effect=RuntimeError("exec")) as execv:
                 with self.assertRaisesRegex(RuntimeError, "exec"):
                     daemon._restart_daemon()
-            make_launcher.assert_called_once_with("0.5.3")
+            make_launcher.assert_called_once_with(updated_version)
             refresh.assert_called_once_with(launcher)
             execv.assert_called_once_with(
                 launcher, [launcher, "-m", "crosscopy.daemon"])
@@ -479,7 +481,8 @@ class WindowsSupportTests(unittest.TestCase):
 
     def test_legacy_windows_daemon_switches_identity_before_binding(self):
         current = os.path.join("C:\\App", "Cross Copy.exe")
-        replacement = os.path.join("C:\\App", "Cross Copy 0.5.2.exe")
+        replacement = os.path.join(
+            "C:\\App", "Cross Copy %s.exe" % __version__)
         with mock.patch.object(daemon.sys, "platform", "win32"), \
                 mock.patch.object(daemon.sys, "executable", current), \
                 mock.patch("crosscopy.windows.make_windows_launcher",

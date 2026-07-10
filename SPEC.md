@@ -241,7 +241,9 @@ action buttons and looked bad on Linux:
 `ccp widget` runs a system-tray / menu-bar companion (`crosscopy/widget.py`):
 - Deps `pystray` + `Pillow` are an OPTIONAL extra (`cross-copy[widget]`); missing deps →
   friendly install hint, exit 1. Tray icon (simple generated glyph) with menu: per-peer
-  "Send files…" (tkinter file dialog) and "Send clipboard text" (tkinter clipboard), pending
+  "Send files…" (native NSOpenPanel on macOS, Windows common dialog, and
+  GTK/KDE chooser on Linux; tkinter only as a last resort) and "Send clipboard
+  text" (tkinter clipboard), pending
   offers with Accept/Decline, "Open panel", "Open web UI", Quit. Menu content refreshes from
   the local API; a background SSE listener triggers notifications-driven refresh.
 - "Open panel" opens `http://localhost:<port>/widget` — a compact liquid-glass panel page

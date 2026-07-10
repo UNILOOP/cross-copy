@@ -86,6 +86,10 @@ The background daemon starts at login through launchd on macOS or a systemd
 user service on Linux. Use `./install.sh --no-service` to skip this step. You
 can enable it later with `ccp daemon install`.
 
+The tray widget uses each desktop's native file chooser. On minimal Linux
+desktops, install `zenity` (GTK) or `kdialog` (KDE) for native file selection;
+Tk is used only when neither desktop chooser is available.
+
 To repair only the shell PATH configuration without reinstalling the package,
 run `./install.sh --path-only` from a cloned repository.
 
@@ -480,7 +484,7 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.5.2 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.5.3 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
 send offers.
@@ -488,6 +492,26 @@ send offers.
 Use Cross Copy on home, small-office, or other trusted private networks. Do
 not use it on public or untrusted Wi-Fi. Pairing and encrypted transport are
 planned for a future release.
+
+## Development
+
+Run the test suite with:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+To prepare a release, use the version-bump script. It verifies that the
+runtime version, package metadata, and README agree before changing anything:
+
+```sh
+python3 scripts/bump_version.py patch
+```
+
+Use `minor`, `major`, or an explicit version such as `1.0.0` instead of
+`patch` when needed. Run `python3 scripts/bump_version.py --check` to validate
+version consistency without modifying files, or add `--dry-run` to preview a
+bump.
 
 ## License
 

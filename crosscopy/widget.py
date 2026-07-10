@@ -260,11 +260,13 @@ def make_icon_image(dark_tray=False):
 
 
 # ---------------------------------------------------------------------------
-# tkinter helpers (lazy — tkinter may be missing on minimal installs)
+# Desktop integration helpers
 # ---------------------------------------------------------------------------
 
 TK_HINT = ("tkinter is not available. On Linux, install python3-tk; on "
            "Windows, reinstall Python with the Tcl/Tk option enabled.")
+FILE_PICKER_HINT = ("No file picker is available. On Linux, install zenity "
+                    "or kdialog; otherwise ensure the desktop GUI is running.")
 
 
 def _tk_root():
@@ -272,20 +274,6 @@ def _tk_root():
     root = tkinter.Tk()
     root.withdraw()
     return root
-
-
-def pick_files():
-    """File-picker dialog. Returns a list of paths ([] on cancel),
-    or None when tkinter is unusable."""
-    try:
-        root = _tk_root()
-        from tkinter import filedialog
-        paths = list(filedialog.askopenfilenames(
-            parent=root, title="cross-copy — send files"))
-        root.destroy()
-        return paths
-    except Exception:
-        return None
 
 
 def read_clipboard_text():
@@ -460,17 +448,23 @@ class WidgetApp(object):
         threading.Thread(target=fn, args=args, daemon=True).start()
 
     def send_files(self, peer):
+        from crosscopy.filepicker import pick_files
+
+        # Native modal dialogs must be opened from the tray callback/main
+        # thread (especially NSOpenPanel on macOS). Only the network work is
+        # moved to a background thread after the user has chosen files.
+        paths = pick_files()
+        if paths is None:
+            notify("Cross Copy", FILE_PICKER_HINT)
+            return
+        if not paths:
+            return  # dialog cancelled
+
         def work():
-            paths = pick_files()
-            if paths is None:
-                notify("cross-copy", TK_HINT)
-                return
-            if not paths:
-                return  # dialog cancelled
             ok, res = api_post("/api/send",
                                {"peer_id": peer["id"], "paths": paths})
             if not ok:
-                notify("cross-copy", "Send failed: %s"
+                notify("Cross Copy", "Send failed: %s"
                        % (res.get("error") or "daemon error"))
             elif res.get("offer_id"):  # popup its outcome when it resolves
                 self._my_sends[res["offer_id"]] = peer.get("name") or "peer"
