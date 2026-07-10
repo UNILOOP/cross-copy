@@ -12,9 +12,12 @@
 #                  (systemd user unit on Linux, launchd agent on macOS).
 #                  Enable it later any time with:  ccp daemon install
 #   --service      accepted for back-compat; autostart is now the default.
+#   --path-only    configure ~/.local/bin for the default shell, then exit.
 #
 # Environment:
-#   REPO_URL     override the git repo used when not running from a checkout.
+#   REPO_URL          override the git repo used when not running from a checkout.
+#   CROSSCOPY_SHELL   override shell detection for PATH setup (e.g. zsh, bash).
+#   CROSSCOPY_NO_SHELL_RELOAD=1  do not start a refreshed interactive shell.
 #
 # Compatible with macOS's stock bash 3.2 and any modern Linux bash.
 
@@ -23,23 +26,26 @@ set -euo pipefail
 REPO_URL="${REPO_URL:-https://github.com/UNILOOP/cross-copy.git}"
 
 INSTALL_SERVICE=1
+PATH_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --no-service) INSTALL_SERVICE=0 ;;
         --service) ;; # back-compat no-op: autostart is now the default
+        --path-only) PATH_ONLY=1 ;;
         -h|--help)
             # In `curl | bash` mode $0 is not this script; fall back to a
             # short usage message instead of printing nothing.
             if [ -f "$0" ] && sed -n '2,19p' "$0" 2>/dev/null; then
                 :
             else
-                echo "Usage: install.sh [--no-service]"
+                echo "Usage: install.sh [--no-service] [--path-only]"
                 echo "  --no-service   skip daemon autostart setup (ccp daemon install)"
+                echo "  --path-only    only add ~/.local/bin to the default shell PATH"
             fi
             exit 0
             ;;
         *)
-            echo "Unknown option: $arg (supported: --no-service, --service)" >&2
+            echo "Unknown option: $arg (supported: --no-service, --service, --path-only)" >&2
             exit 2
             ;;
     esac
@@ -49,6 +55,136 @@ info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
+BIN_DIR="$HOME/.local/bin"
+PATH_MARKER_BEGIN="# >>> cross-copy PATH >>>"
+PATH_MARKER_END="# <<< cross-copy PATH <<<"
+
+profile_has_managed_path() {
+    [ -f "$1" ] && grep -F "$PATH_MARKER_BEGIN" "$1" >/dev/null 2>&1
+}
+
+append_posix_path_block() {
+    local profile="$1"
+    if profile_has_managed_path "$profile"; then
+        info "$profile already has the Cross Copy PATH setup."
+        return
+    fi
+    mkdir -p "$(dirname "$profile")"
+    if [ -s "$profile" ]; then
+        printf '\n' >> "$profile"
+    fi
+    cat >> "$profile" <<'EOF'
+# >>> cross-copy PATH >>>
+case ":$PATH:" in
+    *:"$HOME/.local/bin":*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+# <<< cross-copy PATH <<<
+EOF
+    info "Added ~/.local/bin to PATH in $profile."
+}
+
+append_fish_path_block() {
+    local profile="$HOME/.config/fish/conf.d/cross-copy.fish"
+    if profile_has_managed_path "$profile"; then
+        info "$profile already has the Cross Copy PATH setup."
+        return
+    fi
+    mkdir -p "$(dirname "$profile")"
+    if [ -s "$profile" ]; then
+        printf '\n' >> "$profile"
+    fi
+    cat >> "$profile" <<'EOF'
+# >>> cross-copy PATH >>>
+if not contains -- "$HOME/.local/bin" $PATH
+    set -gx PATH "$HOME/.local/bin" $PATH
+end
+# <<< cross-copy PATH <<<
+EOF
+    info "Added ~/.local/bin to PATH in $profile."
+}
+
+append_csh_path_block() {
+    local profile="$HOME/.cshrc"
+    if profile_has_managed_path "$profile"; then
+        info "$profile already has the Cross Copy PATH setup."
+        return
+    fi
+    if [ -s "$profile" ]; then
+        printf '\n' >> "$profile"
+    fi
+    cat >> "$profile" <<'EOF'
+# >>> cross-copy PATH >>>
+set path = ( "$HOME/.local/bin" $path )
+# <<< cross-copy PATH <<<
+EOF
+    info "Added ~/.local/bin to PATH in $profile."
+}
+
+configure_shell_path() {
+    local shell_path="${CROSSCOPY_SHELL:-${SHELL:-}}"
+    local shell_name="${shell_path##*/}"
+    if [ -z "$shell_name" ]; then
+        shell_name="bash"
+    fi
+
+    case "$shell_name" in
+        zsh)
+            append_posix_path_block "$HOME/.zshrc"
+            ;;
+        bash)
+            append_posix_path_block "$HOME/.bashrc"
+            if [ -f "$HOME/.bash_profile" ]; then
+                append_posix_path_block "$HOME/.bash_profile"
+            elif [ -f "$HOME/.bash_login" ]; then
+                append_posix_path_block "$HOME/.bash_login"
+            else
+                append_posix_path_block "$HOME/.profile"
+            fi
+            ;;
+        fish)
+            append_fish_path_block
+            ;;
+        csh|tcsh)
+            append_csh_path_block
+            ;;
+        *)
+            append_posix_path_block "$HOME/.profile"
+            ;;
+    esac
+
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) export PATH="$BIN_DIR:$PATH" ;;
+    esac
+}
+
+start_refreshed_shell() {
+    [ "${CROSSCOPY_NO_SHELL_RELOAD:-0}" = "1" ] && return
+    [ -t 1 ] || return
+    [ -r /dev/tty ] || return
+
+    local shell_path="${CROSSCOPY_SHELL:-${SHELL:-}}"
+    if [ -z "$shell_path" ]; then
+        shell_path="$(command -v bash 2>/dev/null || true)"
+    elif [ "${shell_path#/}" = "$shell_path" ]; then
+        shell_path="$(command -v "$shell_path" 2>/dev/null || true)"
+    fi
+    if [ -z "$shell_path" ] || [ ! -x "$shell_path" ]; then
+        warn "Could not locate your login shell. Open a new terminal to use ccp."
+        return
+    fi
+
+    info "Reloading $(basename "$shell_path") so ccp is available in this terminal."
+    # exec replaces this installer process, so its EXIT trap would not run.
+    # Clean the temporary source checkout first when a full install created it.
+    if type cleanup >/dev/null 2>&1; then
+        cleanup
+        trap - EXIT
+    fi
+    exec "$shell_path" -l < /dev/tty
+}
+
 # ---------------------------------------------------------------------------
 # 1. Detect OS
 # ---------------------------------------------------------------------------
@@ -57,6 +193,13 @@ case "$OS" in
     Darwin|Linux) ;;
     *) die "Unsupported OS: $OS (cross-copy supports macOS and Linux)" ;;
 esac
+
+if [ "$PATH_ONLY" -eq 1 ]; then
+    configure_shell_path
+    info "PATH setup complete."
+    start_refreshed_shell
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Find a suitable Python (>= 3.9)
@@ -130,7 +273,6 @@ fi
 # 4. Install: prefer pipx, fall back to a dedicated venv
 # ---------------------------------------------------------------------------
 VENV_DIR="$HOME/.local/share/cross-copy/venv"
-BIN_DIR="$HOME/.local/bin"
 CCP=""
 
 if command -v pipx >/dev/null 2>&1; then
@@ -186,19 +328,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. PATH check for ~/.local/bin
+# 5. Add ~/.local/bin to the user's shell PATH
 # ---------------------------------------------------------------------------
-case ":$PATH:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-        warn "$BIN_DIR is not on your PATH."
-        echo "  Add it by appending this line to your shell config:" >&2
-        echo "" >&2
-        echo "    export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
-        echo "" >&2
-        echo "  (~/.bashrc for bash, ~/.zshrc for zsh — then restart your shell.)" >&2
-        ;;
-esac
+configure_shell_path
 
 # ---------------------------------------------------------------------------
 # 6. Verify
@@ -266,3 +398,5 @@ The daemon now starts at login automatically (unless you used --no-service —
 enable later with 'ccp daemon install'), and it also auto-starts the first
 time you run a ccp command. No further setup needed.
 EOF
+
+start_refreshed_shell

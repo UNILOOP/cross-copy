@@ -8,6 +8,26 @@ function Write-Info([string]$Message) {
     Write-Host "==> $Message" -ForegroundColor Blue
 }
 
+function Publish-EnvironmentChange {
+    try {
+        if (-not ("CrossCopy.NativeMethods" -as [type])) {
+            Add-Type -Namespace CrossCopy -Name NativeMethods -MemberDefinition @"
+                [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+                public static extern System.IntPtr SendMessageTimeout(
+                    System.IntPtr hWnd, uint Msg, System.UIntPtr wParam,
+                    string lParam, uint flags, uint timeout,
+                    out System.UIntPtr result);
+"@
+        }
+        $result = [UIntPtr]::Zero
+        [void][CrossCopy.NativeMethods]::SendMessageTimeout(
+            [IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, "Environment",
+            0x2, 5000, [ref]$result)
+    } catch {
+        Write-Warning "The PATH was updated, but Windows could not notify other applications about the change."
+    }
+}
+
 $InstallRoot = Join-Path $env:LOCALAPPDATA "CrossCopy"
 $VenvDir = Join-Path $InstallRoot "venv"
 $BinDir = Join-Path $InstallRoot "bin"
@@ -36,6 +56,10 @@ $Kept = @($UserPath -split ";" | Where-Object {
     $_ -and $_.TrimEnd("\") -ine $BinDir.TrimEnd("\")
 })
 [Environment]::SetEnvironmentVariable("Path", ($Kept -join ";"), "User")
+$env:Path = (@($env:Path -split ";" | Where-Object {
+    $_ -and $_.TrimEnd("\") -ine $BinDir.TrimEnd("\")
+}) -join ";")
+Publish-EnvironmentChange
 
 if (Test-Path $InstallRoot) {
     Write-Info "Removing $InstallRoot"
@@ -60,4 +84,4 @@ if ($DeleteData -and (Test-Path $DataDir)) {
     Write-Info "Keeping $DataDir"
 }
 
-Write-Info "Cross Copy uninstalled. Open a new terminal to refresh PATH."
+Write-Info "Cross Copy uninstalled and removed from PATH."

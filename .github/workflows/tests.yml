@@ -47,6 +47,10 @@ jobs:
           & .\install.ps1
           $ccp = Join-Path $env:LOCALAPPDATA "CrossCopy\venv\Scripts\ccp.exe"
           & $ccp version
+          if (-not (Get-Command ccp -ErrorAction SilentlyContinue)) { throw "ccp is not available in the current PowerShell PATH" }
+          & ccp version
+          $bin = Join-Path $env:LOCALAPPDATA "CrossCopy\bin"
+          if (-not ([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") })) { throw "Cross Copy was not persisted in user PATH" }
           $ping = Invoke-RestMethod "http://127.0.0.1:7373/api/ping"
           if (-not $ping.version) { throw "installed daemon did not answer" }
           $daemonInfo = Get-Content (Join-Path $env:CROSSCOPY_HOME "daemon.json") | ConvertFrom-Json
@@ -62,7 +66,6 @@ jobs:
           if (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue) { throw "widget survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue) { throw "daemon Run entry survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue) { throw "widget Run entry survived uninstall" }
-          $bin = Join-Path $env:LOCALAPPDATA "CrossCopy\bin"
           if (@([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") }).Count) { throw "Cross Copy survived in user PATH" }
       - name: Smoke test installer lifecycle (PowerShell 7)
         if: runner.os == 'Windows' && matrix.python == '3.14'
@@ -73,6 +76,10 @@ jobs:
           & .\install.ps1
           $ccp = Join-Path $env:LOCALAPPDATA "CrossCopy\venv\Scripts\ccp.exe"
           & $ccp version
+          if (-not (Get-Command ccp -ErrorAction SilentlyContinue)) { throw "ccp is not available in the current PowerShell PATH" }
+          & ccp version
+          $bin = Join-Path $env:LOCALAPPDATA "CrossCopy\bin"
+          if (-not ([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") })) { throw "Cross Copy was not persisted in user PATH" }
           $ping = Invoke-RestMethod "http://127.0.0.1:7373/api/ping"
           if (-not $ping.version) { throw "installed daemon did not answer" }
           $daemonInfo = Get-Content (Join-Path $env:CROSSCOPY_HOME "daemon.json") | ConvertFrom-Json
@@ -88,5 +95,4 @@ jobs:
           if (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue) { throw "widget survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue) { throw "daemon Run entry survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue) { throw "widget Run entry survived uninstall" }
-          $bin = Join-Path $env:LOCALAPPDATA "CrossCopy\bin"
           if (@([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") }).Count) { throw "Cross Copy survived in user PATH" }

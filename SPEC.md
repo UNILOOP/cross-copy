@@ -68,6 +68,12 @@ field (the full string, UTF-8, max 1 MB — reject larger with 400), no `files` 
 - `ccp daemon uninstall` — stop + disable + remove the unit/plist.
 - install.sh sets up autostart by DEFAULT by calling `ccp daemon install`
   (opt-out flag `--no-service`; `--service` kept as a no-op alias for back-compat).
+- install.sh also adds `~/.local/bin` to the detected user's shell startup
+  configuration. Bash interactive and login profiles, zsh, fish, csh/tcsh,
+  and POSIX-compatible shells are handled with idempotent managed blocks.
+  Interactive installs start a refreshed login shell in the same terminal;
+  non-interactive installs skip the reload. `--path-only` repairs only this
+  configuration. uninstall.sh removes only the managed blocks it created.
 
 ## Reciprocal discovery — "hello" (v0.3)
 
@@ -243,7 +249,9 @@ action buttons and looked bad on Linux:
 
 - `install.ps1` installs a dedicated venv under `%LOCALAPPDATA%\CrossCopy`,
   includes the `widget` extra, creates a `ccp.cmd` user-PATH shim, and enables
-  daemon/widget login startup by default. `uninstall.ps1` reverses it and keeps
+  daemon/widget login startup by default. It persists the bin directory in
+  the user PATH, updates the current PowerShell process, and broadcasts the
+  environment change to Windows. `uninstall.ps1` reverses it and keeps
   `~\.crosscopy` unless asked to remove data.
 - Detached child processes use `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`;
   the login launcher uses a venv-local `pythonw.exe` copy named `Cross Copy.exe`

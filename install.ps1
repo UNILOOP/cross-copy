@@ -15,6 +15,26 @@ function Write-Warn([string]$Message) {
     Write-Warning $Message
 }
 
+function Publish-EnvironmentChange {
+    try {
+        if (-not ("CrossCopy.NativeMethods" -as [type])) {
+            Add-Type -Namespace CrossCopy -Name NativeMethods -MemberDefinition @"
+                [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+                public static extern System.IntPtr SendMessageTimeout(
+                    System.IntPtr hWnd, uint Msg, System.UIntPtr wParam,
+                    string lParam, uint flags, uint timeout,
+                    out System.UIntPtr result);
+"@
+        }
+        $result = [UIntPtr]::Zero
+        [void][CrossCopy.NativeMethods]::SendMessageTimeout(
+            [IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, "Environment",
+            0x2, 5000, [ref]$result)
+    } catch {
+        Write-Warn "The PATH was saved, but Windows could not notify other applications about the change."
+    }
+}
+
 if ($env:OS -ne "Windows_NT") {
     throw "install.ps1 is for Windows. Use ./install.sh on macOS or Linux."
 }
@@ -124,12 +144,21 @@ try {
 
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $PathEntries = @($UserPath -split ";" | Where-Object { $_ })
+    $PathChanged = $false
     if (-not ($PathEntries | Where-Object { $_.TrimEnd("\") -ieq $BinDir.TrimEnd("\") })) {
         $NewPath = if ($UserPath) { "$BinDir;$UserPath" } else { $BinDir }
         [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
+        $PathChanged = $true
         Write-Info "Added $BinDir to your user PATH."
     }
-    $env:Path = "$BinDir;$env:Path"
+    $PersistedPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if (-not ($PersistedPath -split ";" | Where-Object { $_ -and $_.TrimEnd("\") -ieq $BinDir.TrimEnd("\") })) {
+        throw "Cross Copy was installed, but $BinDir could not be saved to your user PATH."
+    }
+    if (-not ($env:Path -split ";" | Where-Object { $_ -and $_.TrimEnd("\") -ieq $BinDir.TrimEnd("\") })) {
+        $env:Path = "$BinDir;$env:Path"
+    }
+    if ($PathChanged) { Publish-EnvironmentChange }
 
     Write-Info "Verifying install ..."
     & $CcpExe version
@@ -158,4 +187,4 @@ try {
 Write-Host ""
 Write-Info "Cross Copy installed!"
 Write-Host "If Windows Defender Firewall prompts, allow Python/Cross Copy on Private networks so other devices on your LAN can connect."
-Write-Host "Open a new PowerShell window, then try: ccp devices"
+Write-Host "The ccp command is available in this PowerShell session. Try: ccp devices"

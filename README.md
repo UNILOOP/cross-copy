@@ -36,13 +36,15 @@ Administrator access is not required.
    irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.ps1 | iex
    ```
 
-3. Open a new PowerShell window so the updated user PATH is available.
-4. If Windows Defender Firewall asks for permission, allow Cross Copy on
+3. If Windows Defender Firewall asks for permission, allow Cross Copy on
    Private networks.
 
 The installer creates a dedicated environment in
 `%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and configures the
 daemon and notification-area widget to start when you sign in.
+
+The installer updates both your persistent user PATH and the current
+PowerShell session, so `ccp` is available immediately.
 
 To install from a cloned repository instead:
 
@@ -74,9 +76,18 @@ cd cross-copy
 The installer uses `pipx` when it is available. Otherwise, it creates a
 self-contained virtual environment and links `ccp` into `~/.local/bin`.
 
+It adds `~/.local/bin` to the startup file for your default shell. Interactive
+installs then reload that shell in the same terminal, so `ccp` is available as
+soon as installation finishes. Bash, zsh, fish, csh, tcsh, and
+POSIX-compatible shells are supported. The PATH update is safe to run more
+than once.
+
 The background daemon starts at login through launchd on macOS or a systemd
 user service on Linux. Use `./install.sh --no-service` to skip this step. You
 can enable it later with `ccp daemon install`.
+
+To repair only the shell PATH configuration without reinstalling the package,
+run `./install.sh --path-only` from a cloned repository.
 
 ### Confirm the installation
 

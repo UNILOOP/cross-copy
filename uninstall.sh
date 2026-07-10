@@ -16,6 +16,29 @@ VENV_DIR="$HOME/.local/share/cross-copy/venv"
 BIN_LINK="$HOME/.local/bin/ccp"
 DATA_DIR="${CROSSCOPY_HOME:-$HOME/.crosscopy}"
 REMOVED_SOMETHING=0
+PATH_MARKER_BEGIN="# >>> cross-copy PATH >>>"
+PATH_MARKER_END="# <<< cross-copy PATH <<<"
+
+remove_managed_path_block() {
+    local profile="$1"
+    [ -f "$profile" ] || return 0
+    grep -F "$PATH_MARKER_BEGIN" "$profile" >/dev/null 2>&1 || return 0
+    if ! grep -F "$PATH_MARKER_END" "$profile" >/dev/null 2>&1; then
+        warn "Leaving incomplete Cross Copy PATH block in $profile unchanged."
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp "${profile}.cross-copy.XXXXXX")"
+    awk -v begin="$PATH_MARKER_BEGIN" -v end="$PATH_MARKER_END" '
+        $0 == begin { removing = 1; next }
+        $0 == end { removing = 0; next }
+        !removing { print }
+    ' "$profile" > "$tmp"
+    cat "$tmp" > "$profile"
+    rm -f "$tmp"
+    info "Removed Cross Copy PATH setup from $profile"
+    REMOVED_SOMETHING=1
+}
 
 # ---------------------------------------------------------------------------
 # 1. Tear down autostart + stop the daemon, while `ccp` still exists.
@@ -97,6 +120,21 @@ if [ -L "$BIN_LINK" ] || [ -f "$BIN_LINK" ]; then
     rm -f "$BIN_LINK"
     REMOVED_SOMETHING=1
 fi
+
+# Remove only PATH entries written by install.sh. Existing user-managed PATH
+# configuration is deliberately left untouched.
+for profile in \
+    "$HOME/.profile" \
+    "$HOME/.bashrc" \
+    "$HOME/.bash_profile" \
+    "$HOME/.bash_login" \
+    "$HOME/.zshrc" \
+    "$HOME/.zprofile" \
+    "$HOME/.cshrc" \
+    "$HOME/.config/fish/conf.d/cross-copy.fish"
+do
+    remove_managed_path_block "$profile"
+done
 
 if [ "$REMOVED_SOMETHING" -eq 0 ]; then
     warn "No cross-copy installation found (pipx package, $VENV_DIR, or $BIN_LINK)."
