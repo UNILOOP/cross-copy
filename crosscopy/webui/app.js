@@ -36,6 +36,8 @@
     shareTextBtn: $("copy-text-btn"),
     destInput: $("dest-input"),
     offersStack: $("offers-stack"),
+    resumesSection: $("resumes-section"),
+    resumesList: $("resumes-list"),
     peersList: $("peers-list"),
     addPeerForm: $("add-peer-form"),
     peerHost: $("peer-host"),
@@ -291,6 +293,62 @@
     });
   }
 
+  function renderResumes(resumes) {
+    els.resumesList.textContent = "";
+    els.resumesSection.classList.toggle("hidden", !resumes.length);
+    resumes.forEach(function (session) {
+      var card = el("div", "glass resume-card");
+      var source = (session.source && session.source.name) || "unknown device";
+      var received = session.received_bytes || 0;
+      var total = session.total_bytes || 0;
+      var percent = total ? Math.min(100, Math.round(received * 100 / total)) : 0;
+      var head = el("div", "resume-head");
+      head.appendChild(el("strong", null, "From " + source));
+      head.appendChild(el("span", "resume-percent", percent + "%"));
+      card.appendChild(head);
+      card.appendChild(el("div", "resume-dest", session.dest || ""));
+      var track = el("div", "resume-progress-track");
+      var bar = el("div", "resume-progress-bar");
+      bar.style.width = percent + "%";
+      track.appendChild(bar);
+      card.appendChild(track);
+      card.appendChild(el("div", "resume-size",
+        humanSize(received) + " of " + humanSize(total) + " received"));
+      if (!session.available) {
+        card.appendChild(el("p", "resume-unavailable",
+          session.unavailable_reason || "The source is no longer sharing these files."));
+      }
+      var actions = el("div", "resume-actions");
+      var resume = el("button", "btn btn-primary", "Resume");
+      resume.disabled = !session.available;
+      if (!session.available) resume.title = "The source must still be sharing the same files";
+      resume.addEventListener("click", function () {
+        resume.disabled = true;
+        resume.textContent = "Resuming…";
+        api("/api/resumes/" + session.id + "/resume", { method: "POST" })
+          .then(function (result) {
+            toast("Transfer completed: " + (result.files_written || []).length +
+                  " file(s) verified", "success");
+          }).catch(function (err) {
+            toast("Resume failed: " + err.message, "error");
+          }).then(refresh);
+      });
+      var remove = el("button", "btn btn-danger", "Remove partial files");
+      remove.addEventListener("click", function () {
+        if (!window.confirm("Remove the saved partial files for this transfer?")) return;
+        remove.disabled = true;
+        api("/api/resumes/" + session.id + "/remove", { method: "POST" })
+          .then(function () { toast("Partial files removed", "success"); })
+          .catch(function (err) { toast("Remove failed: " + err.message, "error"); })
+          .then(refresh);
+      });
+      actions.appendChild(resume);
+      actions.appendChild(remove);
+      card.appendChild(actions);
+      els.resumesList.appendChild(card);
+    });
+  }
+
   function doAcceptOffer(offer, acceptBtn, declineBtn) {
     acceptBtn.disabled = true;
     declineBtn.disabled = true;
@@ -367,15 +425,19 @@
       delete state.watch[offerId];
     }
     state.watch[offerId] = setInterval(function () {
-      ticks++;
       api("/api/send/" + offerId).then(function (o) {
         var s = o.status || "pending";
         setSendStatus(peerId, labels[s] || s,
           s === "completed" ? "ok" :
           (s === "declined" || s === "failed" || s === "expired") ? "bad" : "");
+        if (s === "pending") {
+          ticks++;
+          if (ticks >= SEND_POLL_MAX) stop();
+        } else {
+          ticks = 0;
+        }
         if (s !== "pending" && s !== "accepted") stop();
       }).catch(stop);
-      if (ticks >= SEND_POLL_MAX) stop();
     }, SEND_POLL_MS);
   }
 
@@ -544,12 +606,14 @@
       api("/api/status"),
       api("/api/peers?with_clipboard=1"),
       // Older daemons have no /api/offers — treat 404 (or any error) as none.
-      api("/api/offers").catch(function () { return { offers: [] }; })
+      api("/api/offers").catch(function () { return { offers: [] }; }),
+      api("/api/resumes").catch(function () { return { resumes: [] }; })
     ]).then(function (results) {
       setConnected(true);
       renderLocal(results[0]);
       renderPeers(results[1].peers || []);
       renderOffers((results[2] && results[2].offers) || []);
+      renderResumes((results[3] && results[3].resumes) || []);
       // Daemon reachable: if the event stream is down (e.g. it was an older
       // daemon without /api/events that has since updated), try it again.
       if (!state.es) connectEvents();

@@ -21,7 +21,8 @@ Python >= 3.9. Dependencies: `flask`, `requests`, `zeroconf>=0.100`. Nothing els
 - Config/home dir: `~/.crosscopy/`. Env override: `CROSSCOPY_HOME`.
   Contents: `config.json` (device name, device id (uuid4), manual peers list),
   `daemon.json` (written by running daemon: `{"pid": int, "port": int}`, removed on clean exit),
-  `daemon.log`, `staging/` (web-UI uploaded files), `clipboard.json` (current manifest).
+  `daemon.log`, `staging/` (web-UI uploaded files), `clipboard.json` (current manifest),
+  `resumes/` (registry pointers for incomplete destination-local transfers).
 - Zeroconf service type: `_crosscopy._tcp.local.`; service name `<device_id>._crosscopy._tcp.local.`;
   TXT properties: `id`, `name`, `platform` (`darwin`/`linux`/`win32`), `version`.
 - Env `CROSSCOPY_NO_MDNS=1` disables zeroconf (for tests; manual peers still work).
@@ -151,10 +152,12 @@ transfers. Files land in the receiver's `receive_dir` (config, default `~/Downlo
 `~` expanded server-side; accept may override with an explicit dest).
 
 Offer object: `{"offer_id": uuid, "from": {"id","name","platform"}, "sender_port": int,
-"kind": "files"|"text", "files": [{"index","rel_path","size"}] (files kind),
+"kind": "files"|"text", "files": [{"index","rel_path","size","sha256"}] (files kind),
 "text": "..." (text kind, full string ≤1MB), "total_size": int, "created_at": epoch,
 "status": "pending"|"accepted"|"declined"|"completed"|"failed"|"expired"}`.
-Offers expire 300 s after creation (both sides); expired/terminal offers are pruned.
+Pending offers expire after 300 s; accepted resumable transfers remain active
+for 24 hours by default (`CROSSCOPY_ACCEPTED_TTL` overrides this).
+Expired/terminal offers are pruned.
 All offer state is in-memory in the daemon (lost on restart — fine).
 
 Sender local API:
@@ -168,7 +171,8 @@ Peer-facing (both directions):
   as a pending incoming offer, fires SSE `offers` event + desktop notification, returns
   `{"status": "pending"}`.
 - `GET /api/offer/<offer_id>/file/<index>` (sender hosts): streams the offered file while the
-  offer is pending/accepted; 410 otherwise.
+  offer is pending/accepted; supports HTTP byte ranges and returns checksum/size headers;
+  410 otherwise.
 - `POST /api/offer/<offer_id>/result` (sender hosts): body `{"result": "accepted"|"declined"|
   "completed"|"failed"}` — receiver reports outcomes; sender updates state, fires SSE
   `offers` event + notification on declined/completed/failed.
@@ -177,8 +181,9 @@ Receiver local API:
 - `GET /api/offers` → `{"offers": [pending incoming offers]}` (text offers include the text).
 - `POST /api/offers/<offer_id>/accept` body `{"dest": optional abs dir}` → text: returns
   `{"kind":"text","text",...}` immediately; files: pulls all files from the sender into dest
-  (collision renames, partial cleanup like paste), reports `accepted` then `completed`
-  (or `failed`) to the sender, returns `{"kind":"files","files_written",...}`.
+  (collision renames, persistent partial state, range resume, and SHA-256 verification),
+  reports `accepted` then `completed`. An interruption returns the offer to pending so a
+  later accept resumes it, and returns `{"kind":"files","files_written",...}` on success.
 - `POST /api/offers/<offer_id>/decline` → reports `declined` to sender, removes offer.
 
 CLI:
@@ -291,22 +296,25 @@ transitions. Must stay dependency-free (pure CSS) and legible (WCAG-ish contrast
   "host_name": "sayeed-macbook",
   "total_size": 12345,
   "files": [
-    {"index": 0, "rel_path": "notes.txt", "size": 100, "source_path": "/abs/path/notes.txt"}
+    {"index": 0, "rel_path": "notes.txt", "size": 100,
+     "sha256": "64-lowercase-hex-digest", "source_path": "/abs/path/notes.txt"}
   ]
 }
 ```
 
 - Directories are expanded recursively **at copy time**; each entry's `rel_path` is a POSIX
   relative path that includes the top-level dir name (e.g. `photos/2024/img.jpg`).
-- `source_path` (absolute path on the source machine) is stored locally but **stripped** from
-  manifests served to peers.
+- `source_path` and `mtime_ns` are stored locally but **stripped** from manifests served to
+  peers. The public per-file `sha256` is the expected final digest.
 
 ## Peer-facing HTTP API (used machine→machine)
 
 - `GET /api/ping` → `{"id","name","platform","version"}`
 - `GET /api/clipboard/meta` → manifest (without `source_path`), or 404 `{"error":"clipboard empty"}`
 - `GET /api/clipboard/file/<clipboard_id>/<index>` → file bytes stream
-  (`application/octet-stream`); 410 if `clipboard_id` no longer current; 404 bad index.
+  (`application/octet-stream`) with HTTP Range support plus
+  `X-CrossCopy-SHA256`/`X-CrossCopy-Size`; 410 if `clipboard_id` no longer current;
+  404 bad index; 409 if the source changed after sharing.
 - `POST /api/clipboard/consumed` body `{"clipboard_id": "..."}` → if current clipboard matches
   and op is `move`: delete the source files (and now-empty source dirs), clear clipboard,
   return `{"deleted": true}`. Otherwise `{"deleted": false}`.
@@ -324,14 +332,29 @@ transitions. Must stay dependency-free (pure CSS) and legible (WCAG-ish contrast
 - `POST /api/paste` body `{"dest": "/abs/dir", "peer_id": optional, "clipboard_id": optional}` →
   chooses peer: `peer_id` if given, else the peer with the **newest** non-empty clipboard.
   Downloads all files into `dest` preserving `rel_path` subdirs. Name-collision handling:
-  suffix ` (1)`, ` (2)`... before the extension. After success, POSTs `consumed` to the source.
+  suffix ` (1)`, ` (2)`... before the extension. Partial bytes and transfer state are retained
+  under `dest/.crosscopy-resume/`; retries request only missing ranges. A file is moved to its
+  final path only after size and SHA-256 verification. After complete success, POSTs `consumed`
+  to the source and removes the resume state.
   Returns `{"from": {"id","name"}, "files_written": ["/abs/..."], "total_bytes": int, "op": "copy"|"move"}`.
-  Errors: 404 no peer has a clipboard; 502 transfer failure (partial files cleaned up).
+  Errors: 404 no peer has a clipboard; 502 transfer interruption (partial progress retained).
 - `POST /api/clipboard/clear` → `{"cleared": true}`
 - `POST /api/name` body `{"name": "new-device-name"}` → updates device name in config, returns
   device info. (mDNS TXT name refreshes on next daemon restart.)
 - `POST /api/upload` multipart form, field `files` (repeatable) → saves into
   `~/.crosscopy/staging/<clipboard_id>/`, sets clipboard (op=copy), returns manifest.
+- `GET /api/resumes` → incomplete transfers with source, destination, byte/file progress,
+  and live `available`/`unavailable_reason`. Availability requires the source to confirm the
+  exact active clipboard/offer manifest and current local file metadata. Checks run
+  concurrently with a bounded response deadline and do not rehash large files during menu
+  refreshes. This endpoint is loopback-only.
+- `POST /api/resumes/<id>/resume` → revalidates availability, then resumes missing ranges;
+  the source rereads and verifies every full checksum with a long-running timeout before the
+  transfer continues. Returns 409 when the source is offline, changed, or no longer sharing
+  the transfer. Loopback-only.
+- `POST /api/resumes/<id>/remove` → removes partial bytes and recovery state while preserving
+  files that had already completed checksum verification; 409 while the transfer is actively
+  writing. Unsafe symlinked state is unregistered without following the link. Loopback-only.
 - `GET /` and static assets → web UI from `crosscopy/webui/`.
 
 ## CLI commands (`ccp`)
@@ -339,6 +362,8 @@ transitions. Must stay dependency-free (pure CSS) and legible (WCAG-ish contrast
 - `ccp copy <path...>` — put files/dirs on the network clipboard (op=copy). Auto-starts daemon.
 - `ccp move <path...>` — same with op=move (source files deleted after successful paste).
 - `ccp paste [dir]` — paste newest peer clipboard into dir (default: CWD). `--from <name|id>`.
+- `ccp transfers [--resume ID|--remove ID]` — show incomplete progress, resume only while the
+  exact source share remains available, or discard unusable partial files.
 - `ccp devices` (alias `ccp list`) — table: name, ip, platform, clipboard summary ("3 files, 2.1 MB" or "-").
 - `ccp status` — daemon status + current local clipboard.
 - `ccp clear` — clear local clipboard.

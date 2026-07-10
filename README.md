@@ -293,6 +293,9 @@ pipx inject cross-copy pystray Pillow
 | `ccp offers` | List incoming offers |
 | `ccp accept [id] [directory]` | Accept an offer |
 | `ccp decline [id]` | Decline an offer |
+| `ccp transfers` | List incomplete transfers and their progress |
+| `ccp transfers --resume <id>` | Resume if the same files are still shared |
+| `ccp transfers --remove <id>` | Remove saved partial files and recovery state |
 
 ### Device and application commands
 
@@ -384,11 +387,31 @@ When you run `ccp copy`, Cross Copy records a clipboard manifest. Files are not
 transferred until another computer runs `ccp paste`. The receiving computer
 then downloads the files directly from the source.
 
+Each file is streamed to a hidden partial file and verified against the
+sender's SHA-256 checksum before it appears at its final destination. If the
+connection drops, Cross Copy keeps the verified progress and resumes from the
+last received byte when the paste or accepted offer is retried. Files already
+completed in a multi-file transfer are not downloaded again.
+
+Incomplete transfers appear in `ccp status`, `ccp transfers`, the tray menu,
+the compact widget, and the web interface. Cross Copy enables Resume only
+after the source confirms that the exact clipboard or offer—with the same
+file paths, sizes, and checksums—is still active. If it is no longer shared,
+you can remove the unusable partial files from any of those surfaces. Removal
+is rejected while that transfer is actively writing, so a cleanup action
+cannot race and corrupt an in-progress download.
+
+Transfer lists use a quick manifest and file-metadata check, so large files do
+not make menus time out or repeatedly reread the source disk. Choosing Resume
+then performs the full source checksum check with a long-running verification
+timeout before any additional bytes are accepted. Unsafe or damaged recovery
+state can still be discarded without following filesystem links.
+
 `ccp send` sends only an offer first. The receiving computer pulls the content
 from the sender after the offer is accepted.
 
 For `ccp move`, the source files are deleted only after the receiving computer
-confirms that the complete transfer succeeded.
+confirms that every file passed its final checksum verification.
 
 ## Troubleshooting
 
@@ -484,10 +507,12 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.5.3 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.5.5 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
-send offers.
+send offers. Recovery details and controls, including destination paths and
+partial-file removal, are restricted to clients running on the same computer
+as the daemon.
 
 Use Cross Copy on home, small-office, or other trusted private networks. Do
 not use it on public or untrusted Wi-Fi. Pairing and encrypted transport are

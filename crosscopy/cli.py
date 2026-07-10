@@ -33,6 +33,9 @@ INSTALL_WAIT_SECS = 8.0  # service managers can be slower to start us
 MAX_TEXT_BYTES = 1024 * 1024  # 1 MB, matches the server-side limit
 OFFER_WAIT_SECS = 300.0  # offers expire after 5 minutes (SPEC v0.4)
 OFFER_POLL_SECS = 1.0
+OFFER_TRANSFER_WAIT_SECS = 24 * 60 * 60
+LOCAL_TRANSFER_TIMEOUT = 24 * 60 * 60
+MANIFEST_BUILD_TIMEOUT = 60 * 60
 
 SYSTEMD_UNIT_NAME = "cross-copy"
 LAUNCHD_LABEL = "com.crosscopy.daemon"
@@ -468,7 +471,8 @@ def do_copy_text(text, op):
 def do_copy_files(paths, op):
     """POST file paths to /api/copy and print the result."""
     ensure_daemon()
-    r = api_post("/api/copy", {"paths": paths, "op": op})
+    r = api_post("/api/copy", {"paths": paths, "op": op},
+                 timeout=MANIFEST_BUILD_TIMEOUT)
     if not r.ok:
         die("Copy failed: %s" % api_error_message(r))
     manifest = r.json()
@@ -585,7 +589,7 @@ def cmd_paste(args):
     if getattr(args, "from_", None):
         body["peer_id"] = resolve_peer(args.from_)["id"]
 
-    r = api_post("/api/paste", body, timeout=600)
+    r = api_post("/api/paste", body, timeout=LOCAL_TRANSFER_TIMEOUT)
     if r.status_code == 404:
         die("Nothing to paste — no device on the network has anything copied.\n"
             "Run 'ccp copy <file>' on another machine first.")
@@ -641,9 +645,13 @@ def wait_for_offer_result(offer, peer_name, live):
     offer_id = offer.get("offer_id")
     started = time.time()
     deadline = started + OFFER_WAIT_SECS
+    transfer_deadline = None
     current = offer
     while True:
         status = (current or {}).get("status", "pending")
+        if status == "accepted" and transfer_deadline is None:
+            transfer_deadline = time.time() + OFFER_TRANSFER_WAIT_SECS
+            deadline = transfer_deadline
         if status in ("completed", "declined", "failed", "expired"):
             break
         if time.time() >= deadline:
@@ -687,7 +695,7 @@ def cmd_send(args):
     else:
         body["paths"] = payload
 
-    r = api_post("/api/send", body, timeout=60)
+    r = api_post("/api/send", body, timeout=MANIFEST_BUILD_TIMEOUT)
     if r.status_code == 404:
         die("The daemon no longer knows device '%s' — check 'ccp devices' "
             "and try again." % peer_name)
@@ -803,6 +811,88 @@ def cmd_offers(args):
           "ccp decline [id]")
 
 
+def fetch_partial_transfers():
+    r = api_get("/api/resumes", timeout=30)
+    if not r.ok:
+        die("Could not list partial transfers: %s" % api_error_message(r))
+    return r.json().get("resumes", [])
+
+
+def pick_partial_transfer(sessions, session_id):
+    exact = [item for item in sessions if item.get("id") == session_id]
+    if exact:
+        return exact[0]
+    matches = [item for item in sessions
+               if (item.get("id") or "").startswith(session_id)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die("Partial transfer id '%s' is ambiguous; use more characters."
+            % session_id)
+    die("No partial transfer matches '%s'. See 'ccp transfers'." % session_id)
+
+
+def cmd_transfers(args):
+    ensure_daemon()
+    sessions = fetch_partial_transfers()
+    action_id = args.resume or args.remove
+    if action_id:
+        session = pick_partial_transfer(sessions, action_id)
+        if args.remove:
+            r = api_post("/api/resumes/%s/remove" % session["id"])
+            if not r.ok:
+                die("Could not remove partial files: %s"
+                    % api_error_message(r))
+            print("Removed partial files for transfer %s."
+                  % session["id"][:8])
+            return
+        if not session.get("available"):
+            die("Cannot resume: %s.\nRemove the broken partial files with: "
+                "ccp transfers --remove %s"
+                % (session.get("unavailable_reason")
+                   or "the source is no longer sharing these files",
+                   session["id"][:8]))
+        r = api_post("/api/resumes/%s/resume" % session["id"],
+                     timeout=LOCAL_TRANSFER_TIMEOUT)
+        if not r.ok:
+            die("Resume failed: %s" % api_error_message(r))
+        result = r.json()
+        files = result.get("files_written") or []
+        print("Resumed and verified %s (%s)."
+              % (plural(len(files), "file"),
+                 human_size(result.get("total_bytes", 0))))
+        for path in files:
+            print("   %s" % path)
+        return
+
+    if args.json:
+        print(json.dumps(sessions, indent=2))
+        return
+    if not sessions:
+        print("No partial transfers.")
+        return
+    rows = []
+    for session in sessions:
+        received = int(session.get("received_bytes") or 0)
+        total = int(session.get("total_bytes") or 0)
+        percent = int(round(100.0 * received / total)) if total else 0
+        source = (session.get("source") or {}).get("name") or "unknown"
+        status = "ready" if session.get("available") else "unavailable"
+        rows.append(((session.get("id") or "?")[:8], source,
+                     "%d%% (%s / %s)" % (
+                         percent, human_size(received), human_size(total)),
+                     status, session.get("dest") or "?"))
+    headers = ("ID", "FROM", "PROGRESS", "STATUS", "DESTINATION")
+    widths = [max(len(headers[index]), max(len(row[index]) for row in rows))
+              for index in range(len(headers))]
+    fmt = "  ".join("%%-%ds" % width for width in widths)
+    print(fmt % headers)
+    for row in rows:
+        print(fmt % row)
+    print("\nResume with: ccp transfers --resume <id>")
+    print("Remove partial files with: ccp transfers --remove <id>")
+
+
 def cmd_accept(args):
     ensure_daemon()
     offers = fetch_offers()
@@ -827,12 +917,14 @@ def cmd_accept(args):
         body["dest"] = os.path.abspath(os.path.expanduser(args.dir))
 
     r = api_post("/api/offers/%s/accept" % offer["offer_id"], body,
-                 timeout=600)
+                 timeout=LOCAL_TRANSFER_TIMEOUT)
     if r.status_code == 404:
         die("That offer is gone — it may have expired or been withdrawn.")
     if r.status_code == 502:
-        die("Transfer failed — could not pull the files from %s."
-            % offer_from_name(offer))
+        die("Transfer interrupted while receiving from %s. Partial progress "
+            "was saved; run 'ccp accept %s' again to resume.\n%s"
+            % (offer_from_name(offer), offer["offer_id"],
+               api_error_message(r)))
     if not r.ok:
         die("Accept failed: %s" % api_error_message(r))
     result = r.json()
@@ -1206,6 +1298,11 @@ def cmd_status(args):
             print("   ... and %s more" % plural(extra, "file"))
     else:
         print("📋 Clipboard: empty")
+
+    partial_count = int(status.get("partial_transfers") or 0)
+    if partial_count:
+        print("Incomplete transfers: %s (run 'ccp transfers')"
+              % plural(partial_count, "transfer"))
 
     # Older daemons don't report an "update" key — that's fine.
     update = status.get("update") or {}
@@ -1961,6 +2058,17 @@ def build_parser():
     p = sub.add_parser("offers", help="list pending incoming offers")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_offers)
+
+    p = sub.add_parser(
+        "transfers", help="list, resume, or remove incomplete transfers")
+    actions = p.add_mutually_exclusive_group()
+    actions.add_argument("--resume", metavar="ID",
+                         help="resume a partial transfer if still shared")
+    actions.add_argument("--remove", metavar="ID",
+                         help="remove saved partial files and state")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable list output")
+    p.set_defaults(func=cmd_transfers)
 
     p = sub.add_parser("accept",
                        help="accept a pending offer (newest if no id)")

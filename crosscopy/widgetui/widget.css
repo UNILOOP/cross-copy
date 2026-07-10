@@ -40,6 +40,8 @@ body {
   overflow-x: hidden;
   overflow-y: auto;
 }
+
+.hidden { display: none !important; }
 @media (prefers-color-scheme: dark) { body { background: #10131c; } }
 
 /* Colorful ambient gradient so the blur has something to read against. */
@@ -213,6 +215,37 @@ textarea.send-input {
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-danger { color: var(--bad); }
 .file-btn input[type="file"] { display: none; }
+
+/* ---------- resumable transfers ---------- */
+
+.resume {
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.18);
+}
+.resume-head, .resume-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.resume-percent { color: var(--accent); font-weight: 700; }
+.resume-track {
+  height: 6px;
+  margin-top: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(120, 130, 150, 0.2);
+}
+.resume-bar { height: 100%; background: var(--accent); }
+.resume-meta, .resume-unavailable {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.resume-unavailable { color: var(--bad); }
+.resume-actions { justify-content: flex-start; margin-top: 8px; }
 
 /* ---------- toasts ---------- */
 

@@ -11,7 +11,7 @@ Offer object (the wire form has no "status" and no local-only keys):
   "from": {"id", "name", "platform"},
   "sender_port": 7373,
   "kind": "files" | "text",
-  "files": [{"index", "rel_path", "size"}],   // kind == "files"
+  "files": [{"index", "rel_path", "size", "sha256"}], // kind == "files"
   "text": "...",                              // kind == "text" (<= 1 MB)
   "total_size": int,
   "created_at": epoch_float,
@@ -23,9 +23,10 @@ Outgoing offers additionally keep "source_path" per file entry and a
 "to": {"id","name"} record — both sender-side only, stripped from the wire.
 Incoming offers additionally keep "sender_host" (the request's source IP).
 
-Offers expire OFFER_TTL (300 s, env override CROSSCOPY_OFFER_TTL for tests)
-after creation; expired/terminal offers are pruned lazily on access. Every
-state transition publishes an "offers" event on events.bus; desktop
+Pending offers expire after OFFER_TTL (300 s, env override
+CROSSCOPY_OFFER_TTL for tests); accepted/resumable transfers remain active for
+ACCEPTED_TTL (24 hours by default). Expired/terminal offers are pruned lazily
+on access. Every state transition publishes an "offers" event on events.bus; desktop
 notifications fire on: incoming offer (receiver), declined/completed/failed
 (sender), files saved (receiver).
 """
@@ -35,12 +36,13 @@ import os
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path, PurePosixPath
 
 import requests
 
-from . import clipboard, config
+from . import clipboard, config, transfer
 from .events import bus
 from .notify import notify
 
@@ -49,7 +51,7 @@ log = logging.getLogger("crosscopy.offers")
 OFFER_TTL = float(os.environ.get("CROSSCOPY_OFFER_TTL", "") or 300.0)
 RESULT_TIMEOUT = 5.0             # cross-peer result/offer POSTs stay short
 TRANSFER_TIMEOUT = (5.0, 300.0)  # (connect, read) for file pulls
-CHUNK_SIZE = 64 * 1024
+ACCEPTED_TTL = float(os.environ.get("CROSSCOPY_ACCEPTED_TTL", "") or 86400.0)
 
 ACTIVE_STATES = ("pending", "accepted")
 TERMINAL_STATES = ("declined", "completed", "failed", "expired")
@@ -144,7 +146,12 @@ def plan_local_paths(paths, dest: Path, platform=None):
     mapped = {}
 
     def key(name):
-        return name.casefold() if platform == "win32" else name
+        if platform == "win32":
+            return name.casefold()
+        if platform == "darwin":
+            # Default APFS/HFS+ volumes are case- and normalization-insensitive.
+            return unicodedata.normalize("NFD", name).casefold()
+        return name
 
     def walk(node, source_prefix, local_prefix, local_parent):
         used = set()
@@ -196,9 +203,10 @@ def plan_local_paths(paths, dest: Path, platform=None):
 def wire_offer(offer: dict) -> dict:
     """The offer as POSTed to the peer: no status, no local-only keys."""
     pub = {k: v for k, v in offer.items()
-           if k not in ("status", "to", "sender_host")}
+           if k not in ("status", "to", "sender_host", "last_activity")}
     if offer.get("kind") == "files":
-        pub["files"] = [{k: v for k, v in f.items() if k != "source_path"}
+        pub["files"] = [{k: v for k, v in f.items()
+                         if k not in ("source_path", "mtime_ns")}
                         for f in offer.get("files", [])]
     return pub
 
@@ -206,9 +214,11 @@ def wire_offer(offer: dict) -> dict:
 def public_offer(offer: dict) -> dict:
     """The offer as returned by the local API: status kept, internals
     (source_path, sender_host) stripped."""
-    pub = {k: v for k, v in offer.items() if k != "sender_host"}
+    pub = {k: v for k, v in offer.items()
+           if k not in ("sender_host", "last_activity")}
     if offer.get("kind") == "files":
-        pub["files"] = [{k: v for k, v in f.items() if k != "source_path"}
+        pub["files"] = [{k: v for k, v in f.items()
+                         if k not in ("source_path", "mtime_ns")}
                         for f in offer.get("files", [])]
     return pub
 
@@ -264,6 +274,7 @@ class OffersManager:
             },
             "sender_port": config.get_port(),
             "created_at": time.time(),
+            "last_activity": time.time(),
             "status": "pending",
             "to": {"id": peer.get("id"), "name": peer.get("name")},
         }
@@ -277,7 +288,9 @@ class OffersManager:
             offer["kind"] = "files"
             offer["files"] = [
                 {"index": f["index"], "rel_path": f["rel_path"],
-                 "size": f["size"], "source_path": f["source_path"]}
+                 "size": f["size"], "sha256": f["sha256"],
+                 "mtime_ns": f["mtime_ns"],
+                 "source_path": f["source_path"]}
                 for f in manifest["files"]
             ]
             offer["total_size"] = manifest["total_size"]
@@ -294,6 +307,7 @@ class OffersManager:
         record["status"] = "pending"
         record["sender_host"] = sender_host
         record.setdefault("created_at", time.time())
+        record["last_activity"] = time.time()
         with self._lock:
             self._prune_locked()
             self._incoming[record["offer_id"]] = record
@@ -378,6 +392,7 @@ class OffersManager:
                 if offer.get("status") not in TERMINAL_STATES \
                         and offer.get("status") != status:
                     offer["status"] = status
+                    offer["last_activity"] = time.time()
                     changed = True
                 if remove:
                     table.pop(offer_id, None)
@@ -398,7 +413,11 @@ class OffersManager:
         expired = 0
         for table in (self._incoming, self._outgoing):
             for oid, offer in list(table.items()):
-                if now - offer.get("created_at", 0.0) > self.ttl:
+                ttl = ACCEPTED_TTL if offer.get("status") == "accepted" \
+                    else self.ttl
+                activity = offer.get("last_activity",
+                                     offer.get("created_at", 0.0))
+                if now - activity > ttl:
                     if offer.get("status") not in TERMINAL_STATES:
                         offer["status"] = "expired"
                         expired += 1
@@ -421,6 +440,20 @@ def sender_base_url(offer: dict) -> str:
                                  or config.DEFAULT_PORT))
 
 
+def resume_metadata(offer: dict) -> dict:
+    source = dict(offer.get("from") or {})
+    source["host"] = offer.get("sender_host")
+    source["port"] = int(offer.get("sender_port") or config.DEFAULT_PORT)
+    return {
+        "kind": "offer",
+        "offer_id": offer.get("offer_id"),
+        "source": source,
+        "files": [dict(entry) for entry in offer.get("files") or []],
+        "total_size": int(offer.get("total_size") or sum(
+            int(entry.get("size", 0)) for entry in offer.get("files") or [])),
+    }
+
+
 def report_result(offer: dict, result: str) -> bool:
     """POST an outcome to the sender's /api/offer/<id>/result. Returns True
     on a 200; never raises."""
@@ -437,12 +470,7 @@ def report_result(offer: dict, result: str) -> bool:
 
 
 def pull_files(offer: dict, dest: Path):
-    """Stream every offered file from the sender into `dest` (rel_path
-    subdirs preserved, collisions renamed). Returns (written_paths,
-    total_bytes). On any failure, partial files are removed and RuntimeError
-    is raised."""
-    written = []
-    total_bytes = 0
+    """Pull offered files with persistent range-resume and SHA-256 checks."""
     try:
         entries = offer.get("files", [])
         source_parts = []
@@ -453,35 +481,19 @@ def pull_files(offer: dict, dest: Path):
                                    % entry.get("rel_path"))
             source_parts.append(parts)
         planned = plan_local_paths(source_parts, dest)
-        for entry, parts in zip(entries, planned):
-            target = dest.joinpath(*parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
+
+        def fetch(entry, offset):
             url = "%s/api/offer/%s/file/%d" % (
                 sender_base_url(offer), offer["offer_id"], int(entry["index"]))
-            resp = requests.get(url, stream=True, timeout=TRANSFER_TIMEOUT)
-            if resp.status_code == 410:
-                raise RuntimeError("offer no longer available on sender")
-            resp.raise_for_status()
-            try:
-                with open(target, "wb") as fh:
-                    for chunk in resp.iter_content(CHUNK_SIZE):
-                        if chunk:
-                            fh.write(chunk)
-            except BaseException:
-                try:
-                    target.unlink()
-                except OSError:
-                    pass
-                raise
-            finally:
-                resp.close()
-            written.append(target)
-            total_bytes += target.stat().st_size
+            headers = {"Range": "bytes=%d-" % offset} if offset else {}
+            return requests.get(url, headers=headers, stream=True,
+                                timeout=TRANSFER_TIMEOUT)
+
+        return transfer.download_files(
+            entries, planned, dest, "offer:%s" % offer["offer_id"], fetch,
+            registry_dir=config.resume_registry_dir(),
+            metadata=resume_metadata(offer))
     except Exception as exc:
-        for path in written:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise RuntimeError(str(exc))
-    return written, total_bytes
+        if isinstance(exc, transfer.TransferError):
+            raise
+        raise transfer.TransferError(str(exc))

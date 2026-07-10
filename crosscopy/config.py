@@ -54,6 +54,12 @@ def staging_dir() -> Path:
     return path
 
 
+def resume_registry_dir() -> Path:
+    path = get_home() / "resumes"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Port / platform
 

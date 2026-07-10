@@ -726,6 +726,39 @@ input:focus, textarea:focus {
 .toast.success { border-left-color: var(--ok); }
 .toast.error { border-left-color: var(--bad); }
 
+/* ---------- resumable transfers ---------- */
+
+.resumes-section { margin-bottom: 22px; }
+.resumes-list { display: grid; gap: 12px; }
+.resume-card { padding: 16px; }
+.resume-head, .resume-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.resume-percent { color: var(--accent); font-weight: 700; }
+.resume-dest, .resume-size {
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  margin-top: 5px;
+}
+.resume-progress-track {
+  height: 7px;
+  margin-top: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(120, 130, 150, 0.2);
+}
+.resume-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+.resume-unavailable { color: var(--bad); font-size: 13px; margin: 10px 0 0; }
+.resume-actions { justify-content: flex-start; margin-top: 13px; }
+
 /* ---------- footer ---------- */
 
 .app-footer {

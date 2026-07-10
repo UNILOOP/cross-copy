@@ -9,7 +9,8 @@ The clipboard is a JSON manifest persisted at ~/.crosscopy/clipboard.json:
   "created_at": epoch_float,
   "host_id": "...", "host_name": "...",
   "total_size": int,
-  "files": [{"index", "rel_path", "size", "source_path"}],  // kind == "files"
+  "files": [{"index", "rel_path", "size", "sha256", "source_path"}],
+                                                              // kind == "files"
   "text": "..."                                             // kind == "text"
 }
 
@@ -29,7 +30,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 
-from . import config
+from . import config, transfer
 
 log = logging.getLogger("crosscopy.clipboard")
 
@@ -118,10 +119,13 @@ def manifest_kind(manifest) -> str:
 
 
 def _file_entry(path: Path, rel_path: str) -> dict:
+    snapshot = transfer.source_snapshot(path)
     return {
         "index": 0,  # filled in by build_manifest
         "rel_path": rel_path,
-        "size": path.stat().st_size,
+        "size": snapshot["size"],
+        "sha256": snapshot["sha256"],
+        "mtime_ns": snapshot["mtime_ns"],
         "source_path": str(path),
     }
 
@@ -136,7 +140,8 @@ def public_manifest(manifest):
     if manifest_kind(manifest) == "text":
         return pub
     pub["files"] = [
-        {k: v for k, v in f.items() if k != "source_path"}
+        {k: v for k, v in f.items()
+         if k not in ("source_path", "mtime_ns")}
         for f in manifest.get("files", [])
     ]
     return pub
@@ -144,6 +149,41 @@ def public_manifest(manifest):
 
 # ---------------------------------------------------------------------------
 # Persistence
+
+def _write_manifest(manifest):
+    path = config.clipboard_path()
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _upgrade_file_metadata(manifest):
+    """Add checksums to a pre-resume local manifest after an upgrade."""
+    if manifest_kind(manifest) != "files":
+        return False
+    changed = False
+    for entry in manifest.get("files", []):
+        if (transfer.valid_sha256(entry.get("sha256"))
+                and entry.get("mtime_ns") is not None):
+            continue
+        source = entry.get("source_path")
+        if not source or not os.path.isfile(source):
+            continue
+        try:
+            snapshot = transfer.source_snapshot(source)
+        except (OSError, ValueError) as exc:
+            log.warning("could not checksum existing clipboard file %s: %s",
+                        source, exc)
+            continue
+        entry.update(snapshot)
+        changed = True
+    if changed:
+        manifest["total_size"] = sum(
+            int(entry.get("size", 0)) for entry in manifest.get("files", []))
+    return changed
+
 
 def load_clipboard():
     """Return the current manifest, or None if the clipboard is empty."""
@@ -158,6 +198,12 @@ def load_clipboard():
                 if manifest.get("text"):
                     return manifest
             elif manifest.get("files"):
+                if _upgrade_file_metadata(manifest):
+                    try:
+                        _write_manifest(manifest)
+                    except OSError as exc:
+                        log.warning("could not persist upgraded clipboard: %s",
+                                    exc)
                 return manifest
     except (OSError, ValueError):
         pass
@@ -166,12 +212,7 @@ def load_clipboard():
 
 def set_clipboard(manifest: dict) -> None:
     """Persist the manifest as the current clipboard and drop stale staging."""
-    path = config.clipboard_path()
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    _write_manifest(manifest)
     clean_staging(keep=manifest.get("clipboard_id"))
 
 

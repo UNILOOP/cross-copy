@@ -11,6 +11,8 @@
     name: document.getElementById("device-name"),
     dot: document.getElementById("live-dot"),
     offers: document.getElementById("offers"),
+    resumesCard: document.getElementById("resumes-card"),
+    resumes: document.getElementById("resumes"),
     peers: document.getElementById("peers"),
     toasts: document.getElementById("toasts")
   };
@@ -158,6 +160,57 @@
     });
   }
 
+  function renderResumes(resumes) {
+    els.resumes.textContent = "";
+    els.resumesCard.classList.toggle("hidden", !resumes.length);
+    resumes.forEach(function (session) {
+      var row = el("div", "resume");
+      var source = (session.source && session.source.name) || "unknown";
+      var received = session.received_bytes || 0;
+      var total = session.total_bytes || 0;
+      var percent = total ? Math.min(100, Math.round(received * 100 / total)) : 0;
+      var head = el("div", "resume-head");
+      head.appendChild(el("strong", null, source));
+      head.appendChild(el("span", "resume-percent", percent + "%"));
+      row.appendChild(head);
+      var track = el("div", "resume-track");
+      var bar = el("div", "resume-bar");
+      bar.style.width = percent + "%";
+      track.appendChild(bar);
+      row.appendChild(track);
+      row.appendChild(el("div", "resume-meta",
+        humanSize(received) + " / " + humanSize(total)));
+      if (!session.available) {
+        row.appendChild(el("div", "resume-unavailable",
+          session.unavailable_reason || "No longer shared"));
+      }
+      var actions = el("div", "resume-actions");
+      var resume = el("button", "btn btn-primary", "Resume");
+      resume.disabled = !session.available;
+      resume.addEventListener("click", function () {
+        resume.disabled = true;
+        api("/api/resumes/" + session.id + "/resume", { method: "POST" })
+          .then(function () { toast("Transfer completed and verified", "success"); })
+          .catch(function (err) { toast("Resume failed: " + err.message, "error"); })
+          .then(refresh);
+      });
+      var remove = el("button", "btn btn-danger", "Remove");
+      remove.title = "Remove saved partial files";
+      remove.addEventListener("click", function () {
+        if (!window.confirm("Remove the saved partial files?")) return;
+        remove.disabled = true;
+        api("/api/resumes/" + session.id + "/remove", { method: "POST" })
+          .then(function () { toast("Partial files removed", "success"); })
+          .catch(function (err) { toast("Remove failed: " + err.message, "error"); })
+          .then(refresh);
+      });
+      actions.appendChild(resume);
+      actions.appendChild(remove);
+      row.appendChild(actions);
+      els.resumes.appendChild(row);
+    });
+  }
+
   /* ---------- outgoing send + status watch ---------- */
 
   /* Rows are re-rendered on every refresh, so the inline status lives in
@@ -181,15 +234,19 @@
                    completed: "delivered", declined: "declined",
                    failed: "failed", expired: "expired" };
     state.watch[offerId] = setInterval(function () {
-      ticks++;
       api("/api/send/" + offerId).then(function (o) {
         var s = o.status || "pending";
         setPeerStatus(peerId, labels[s] || s,
           s === "completed" ? "ok" :
           (s === "declined" || s === "failed" || s === "expired") ? "bad" : "");
+        if (s === "pending") {
+          ticks++;
+          if (ticks >= SEND_POLL_MAX) stop();
+        } else {
+          ticks = 0;
+        }
         if (s !== "pending" && s !== "accepted") stop();
       }).catch(stop);
-      if (ticks >= SEND_POLL_MAX) stop();
     }, SEND_POLL_MS);
     function stop() {
       clearInterval(state.watch[offerId]);
@@ -322,11 +379,13 @@
     return Promise.all([
       api("/api/status"),
       api("/api/peers?with_clipboard=1"),
-      api("/api/offers").catch(function () { return { offers: [] }; })
+      api("/api/offers").catch(function () { return { offers: [] }; }),
+      api("/api/resumes").catch(function () { return { resumes: [] }; })
     ]).then(function (r) {
       els.name.textContent = r[0].name || "cross-copy";
       renderPeers(r[1].peers || []);
       renderOffers(r[2].offers || []);
+      renderResumes(r[3].resumes || []);
       fitPanelWindow(); // content changed — keep the app window compact
       if (!state.es) connectEvents();
     }).catch(function () {

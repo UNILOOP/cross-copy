@@ -13,19 +13,20 @@ Trusted-LAN model (v0.1.0): no auth, binds 0.0.0.0.
 """
 
 import json
+import ipaddress
 import logging
 import os
 import queue
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import requests
 from flask import (Flask, Response, jsonify, request, send_file,
                    send_from_directory)
 
-from . import __version__, clipboard, config, offers
+from . import __version__, clipboard, config, offers, transfer
 from .events import bus
 from .offers import safe_rel_parts as _safe_rel_parts
 from .offers import plan_local_paths as _plan_local_paths
@@ -40,8 +41,8 @@ PING_TIMEOUT = 2.0        # seconds, for live peer meta/ping fetches
 CONSUMED_TIMEOUT = 5.0
 OFFER_TIMEOUT = 5.0       # cross-peer offer push
 TRANSFER_TIMEOUT = (5.0, 300.0)  # (connect, read) for file downloads
+RESUME_VERIFY_TIMEOUT = (5.0, 24 * 60 * 60)  # hashing may precede response
 RETRY_CONNECT_TIMEOUT = 3.0      # connect timeout for alternate-address retries
-CHUNK_SIZE = 64 * 1024
 SSE_HEARTBEAT = 15.0      # seconds between ": ping" comments on /api/events
 
 
@@ -203,6 +204,67 @@ def create_app(discovery=None, updater=None) -> Flask:
     may be None, in which case /api/status reports a never-checked state."""
     app = Flask("crosscopy", static_folder=None)
 
+    def _source_entry_available(entry, verify_content=True):
+        source = entry.get("source_path")
+        if not source or not os.path.isfile(source):
+            return False, "source file is missing"
+        try:
+            stat_result = os.stat(source)
+            actual_mtime = getattr(
+                stat_result, "st_mtime_ns",
+                int(stat_result.st_mtime * 1000000000))
+            if stat_result.st_size != int(entry.get("size", -1)):
+                return False, "source file changed since sharing"
+            expected_mtime = entry.get("mtime_ns")
+            if (expected_mtime is not None
+                    and actual_mtime != int(expected_mtime)):
+                return False, "source file changed since sharing"
+            if verify_content:
+                snapshot = transfer.source_snapshot(source, attempts=1)
+                expected_checksum = transfer.transfer_checksum(entry)
+                if (not expected_checksum
+                        or snapshot["sha256"] != expected_checksum):
+                    return False, "source file changed since sharing"
+        except (OSError, TypeError, ValueError):
+            return False, "source file is unavailable"
+        return True, None
+
+    def _serve_source_file(entry):
+        """Serve a stable manifest entry with HTTP Range and integrity data."""
+        # Manifest creation already hashed the source and the receiver always
+        # verifies the advertised digest. Keep serving responsive for very
+        # large files; explicit Resume performs a deep check before this GET.
+        available, reason = _source_entry_available(
+            entry, verify_content=False)
+        if not available:
+            status = 404 if "missing" in reason or "unavailable" in reason else 409
+            return _error(reason, status)
+        source = entry["source_path"]
+        checksum = str(entry.get("sha256") or "").lower()
+        response = send_file(
+            source, mimetype="application/octet-stream", conditional=True,
+            etag=checksum if transfer.valid_sha256(checksum) else True)
+        response.headers["Accept-Ranges"] = "bytes"
+        response.headers["X-CrossCopy-Size"] = str(entry.get("size", 0))
+        if checksum:
+            response.headers["X-CrossCopy-SHA256"] = checksum
+        return response
+
+    def _resume_metadata_for_clipboard(peer, manifest):
+        return {
+            "kind": "clipboard",
+            "clipboard_id": manifest.get("clipboard_id"),
+            "op": manifest.get("op", "copy"),
+            "source": {
+                "id": peer.get("id"),
+                "name": peer.get("name"),
+                "host": peer.get("host"),
+                "port": int(peer.get("port") or config.DEFAULT_PORT),
+            },
+            "files": [dict(entry) for entry in manifest.get("files") or []],
+            "total_size": int(manifest.get("total_size") or 0),
+        }
+
     def _get_peers():
         if discovery is None:
             return []
@@ -217,6 +279,92 @@ def create_app(discovery=None, updater=None) -> Flask:
                 discovery.hello_now()
             except Exception:
                 pass
+
+    def _check_resume_availability(session, verify_content=True,
+                                   timeout=PING_TIMEOUT):
+        if session.get("broken"):
+            return False, "Partial transfer state is unsafe or damaged", None
+        metadata = session.get("metadata") or {}
+        kind = metadata.get("kind")
+        files = metadata.get("files") or []
+        body = {
+            "kind": kind,
+            "clipboard_id": metadata.get("clipboard_id"),
+            "offer_id": metadata.get("offer_id"),
+            "files": files,
+            "verify_content": bool(verify_content),
+        }
+        if kind == "clipboard":
+            source = metadata.get("source") or {}
+            matches = [peer for peer in _get_peers()
+                       if peer.get("id") == source.get("id")]
+            if not matches:
+                return False, "Source device is offline or no longer discovered", None
+            peer = matches[0]
+            try:
+                response = _peer_request(
+                    peer, "POST", "/api/transfer/available",
+                    discovery=discovery, json=body, timeout=timeout)
+            except Exception:
+                return False, "Source device is currently unreachable", None
+        elif kind == "offer":
+            source = metadata.get("source") or {}
+            host = source.get("host")
+            port = int(source.get("port") or config.DEFAULT_PORT)
+            if not host:
+                return False, "Sender address is unavailable", None
+            try:
+                response = requests.post(
+                    "http://%s:%d/api/transfer/available" % (host, port),
+                    json=body, timeout=timeout)
+            except requests.RequestException:
+                return False, "Sender is currently unreachable", None
+            peer = None
+        else:
+            return False, "Unknown partial transfer type", None
+        try:
+            result = response.json()
+        except ValueError:
+            result = {}
+        if not response.ok or not result.get("available"):
+            reason = result.get("reason") or "Source is no longer sharing these files"
+            return False, reason, None
+        return True, None, peer
+
+    def _public_resume_session(session):
+        # Menus only need a quick proof that the exact manifest is active.
+        # The Resume action performs the potentially expensive full checksum
+        # validation before requesting any additional bytes.
+        available, reason, _peer = _check_resume_availability(
+            session, verify_content=False)
+        public = {key: value for key, value in session.items()
+                  if key != "metadata"}
+        metadata = session.get("metadata") or {}
+        public["available"] = available
+        public["unavailable_reason"] = reason
+        public["clipboard_id"] = metadata.get("clipboard_id")
+        public["offer_id"] = metadata.get("offer_id")
+        return public
+
+    def _unavailable_resume_session(session, reason):
+        public = {key: value for key, value in session.items()
+                  if key != "metadata"}
+        metadata = session.get("metadata") or {}
+        public["available"] = False
+        public["unavailable_reason"] = reason
+        public["clipboard_id"] = metadata.get("clipboard_id")
+        public["offer_id"] = metadata.get("offer_id")
+        return public
+
+    def _local_resume_api_error():
+        """Recovery controls may expose paths or delete local partial data."""
+        try:
+            address = str(request.remote_addr or "").split("%", 1)[0]
+            if ipaddress.ip_address(address).is_loopback:
+                return None
+        except ValueError:
+            pass
+        return _error("partial transfer controls are local-only", 403)
 
     def _update_state() -> dict:
         if updater is not None:
@@ -292,11 +440,7 @@ def create_app(discovery=None, updater=None) -> Flask:
         files = manifest.get("files", [])
         if index < 0 or index >= len(files):
             return _error("bad file index", 404)
-        source = files[index].get("source_path")
-        if not source or not os.path.isfile(source):
-            return _error("source file missing", 404)
-        return send_file(source, mimetype="application/octet-stream",
-                         conditional=False)
+        return _serve_source_file(files[index])
 
     @app.post("/api/clipboard/consumed")
     def api_clipboard_consumed():
@@ -363,13 +507,20 @@ def create_app(discovery=None, updater=None) -> Flask:
                 if not isinstance(f, dict) or not f.get("rel_path"):
                     return _error("invalid file entry", 400)
                 try:
-                    entries.append({
+                    entry = {
                         "index": int(f.get("index", i)),
                         "rel_path": str(f["rel_path"]),
                         "size": int(f.get("size", 0)),
-                    })
+                    }
                 except (TypeError, ValueError):
                     return _error("invalid file entry", 400)
+                checksum = str(f.get("sha256") or "").lower()
+                if not transfer.valid_sha256(checksum):
+                    return _error(
+                        "file offer requires a valid SHA-256 checksum; "
+                        "update Cross Copy on the sender", 400)
+                entry["sha256"] = checksum
+                entries.append(entry)
             record["files"] = entries
             try:
                 record["total_size"] = int(
@@ -396,11 +547,38 @@ def create_app(discovery=None, updater=None) -> Flask:
         files = offer.get("files", [])
         if index < 0 or index >= len(files):
             return _error("bad file index", 404)
-        source = files[index].get("source_path")
-        if not source or not os.path.isfile(source):
-            return _error("source file missing", 404)
-        return send_file(source, mimetype="application/octet-stream",
-                         conditional=False)
+        return _serve_source_file(files[index])
+
+    @app.post("/api/transfer/available")
+    def api_transfer_available():
+        """Confirm an exact resumable manifest is still actively shared."""
+        body = request.get_json(silent=True) or {}
+        kind = body.get("kind")
+        if kind == "clipboard":
+            record = clipboard.load_clipboard()
+            if (not record or record.get("clipboard_id")
+                    != body.get("clipboard_id")):
+                return jsonify({"available": False,
+                                "reason": "Clipboard is no longer being shared"})
+        elif kind == "offer":
+            record = offers.manager.get_outgoing(str(body.get("offer_id") or ""))
+            if (not record or record.get("status") not in offers.ACTIVE_STATES):
+                return jsonify({"available": False,
+                                "reason": "Offer is no longer being shared"})
+        else:
+            return _error("invalid transfer kind", 400)
+        expected = body.get("files")
+        actual = record.get("files") or []
+        if not isinstance(expected, list) or not transfer.same_manifest(expected, actual):
+            return jsonify({"available": False,
+                            "reason": "Shared files changed since the interruption"})
+        verify_content = body.get("verify_content", True) is not False
+        for entry in actual:
+            available, reason = _source_entry_available(
+                entry, verify_content=verify_content)
+            if not available:
+                return jsonify({"available": False, "reason": reason})
+        return jsonify({"available": True})
 
     @app.post("/api/offer/<offer_id>/result")
     def api_offer_result(offer_id):
@@ -424,8 +602,124 @@ def create_app(discovery=None, updater=None) -> Flask:
         # daemons survive it); this is ground truth for stop/restart tooling.
         info["pid"] = os.getpid()
         info["clipboard"] = clipboard.load_clipboard()
+        info["partial_transfers"] = len(transfer.list_resume_sessions(
+            config.resume_registry_dir()))
         info["update"] = _update_state()
         return jsonify(info)
+
+    @app.get("/api/resumes")
+    def api_resumes():
+        local_error = _local_resume_api_error()
+        if local_error:
+            return local_error
+        sessions = transfer.list_resume_sessions(config.resume_registry_dir())
+        if not sessions:
+            return jsonify({"resumes": []})
+        executor = ThreadPoolExecutor(max_workers=min(8, len(sessions)))
+        futures = [executor.submit(_public_resume_session, session)
+                   for session in sessions]
+        done, _pending = wait(futures, timeout=PING_TIMEOUT + 0.25)
+        results = []
+        for session, future in zip(sessions, futures):
+            if future in done:
+                try:
+                    results.append(future.result())
+                    continue
+                except Exception:
+                    pass
+            future.cancel()
+            results.append(_unavailable_resume_session(
+                session, "Source availability check timed out"))
+        executor.shutdown(wait=False, cancel_futures=True)
+        return jsonify({"resumes": results})
+
+    @app.post("/api/resumes/<session_id>/remove")
+    def api_resume_remove(session_id):
+        local_error = _local_resume_api_error()
+        if local_error:
+            return local_error
+        try:
+            removed = transfer.discard_resume_session(
+                config.resume_registry_dir(), session_id)
+        except transfer.ResumeActiveError as exc:
+            return _error(str(exc), 409)
+        if not removed:
+            return _error("unknown partial transfer", 404)
+        bus.publish("resumes")
+        return jsonify({"removed": True})
+
+    @app.post("/api/resumes/<session_id>/resume")
+    def api_resume_transfer(session_id):
+        local_error = _local_resume_api_error()
+        if local_error:
+            return local_error
+        session = transfer.get_resume_session(
+            config.resume_registry_dir(), session_id)
+        if not session:
+            return _error("unknown partial transfer", 404)
+        available, reason, peer = _check_resume_availability(
+            session, verify_content=True, timeout=RESUME_VERIFY_TIMEOUT)
+        if not available:
+            return _error(reason or "source is no longer sharing these files", 409)
+        metadata = session.get("metadata") or {}
+        entries = metadata.get("files") or []
+        dest = Path(session["dest"])
+        source_parts = []
+        for entry in entries:
+            parts = _safe_rel_parts(entry.get("rel_path", ""))
+            if parts is None:
+                return _error("partial transfer has an unsafe path", 409)
+            source_parts.append(parts)
+        planned = _plan_local_paths(source_parts, dest)
+        try:
+            if metadata.get("kind") == "clipboard":
+                clipboard_id = metadata["clipboard_id"]
+
+                def fetch(entry, offset):
+                    headers = {"Range": "bytes=%d-" % offset} if offset else {}
+                    return _peer_request(
+                        peer, "GET", "/api/clipboard/file/%s/%d"
+                        % (clipboard_id, entry["index"]), discovery=discovery,
+                        stream=True, timeout=TRANSFER_TIMEOUT, headers=headers)
+
+                transfer_id = "clipboard:%s:%s" % (
+                    (metadata.get("source") or {}).get("id"), clipboard_id)
+                written, total_bytes = transfer.download_files(
+                    entries, planned, dest, transfer_id, fetch,
+                    registry_dir=config.resume_registry_dir(), metadata=metadata)
+                _notify_consumed(peer, clipboard_id, discovery)
+                op = metadata.get("op", "copy")
+            else:
+                source = metadata.get("source") or {}
+                offer = {
+                    "offer_id": metadata.get("offer_id"),
+                    "from": {"id": source.get("id"), "name": source.get("name")},
+                    "sender_host": source.get("host"),
+                    "sender_port": source.get("port"),
+                    "kind": "files",
+                    "files": entries,
+                    "total_size": metadata.get("total_size"),
+                }
+                if not offers.report_result(offer, "accepted"):
+                    return _error("sender no longer has this offer", 409)
+                written, total_bytes = offers.pull_files(offer, dest)
+                offers.report_result(offer, "completed")
+                incoming = offers.manager.get_incoming(offer["offer_id"])
+                if incoming:
+                    offers.manager.set_incoming_status(
+                        offer["offer_id"], "completed")
+                op = "copy"
+        except Exception as exc:
+            bus.publish("resumes")
+            return _error("resume interrupted: %s" % _friendly_error(exc), 502)
+        bus.publish("resumes")
+        return jsonify({
+            "kind": "files",
+            "files_written": [str(path) for path in written],
+            "total_bytes": total_bytes,
+            "dest": str(dest),
+            "op": op,
+        })
 
     @app.get("/api/events")
     def api_events():
@@ -582,8 +876,6 @@ def create_app(discovery=None, updater=None) -> Flask:
         except OSError as exc:
             return _error("cannot create dest dir: %s" % exc, 400)
 
-        written = []
-        total_bytes = 0
         try:
             entries = manifest.get("files", [])
             source_parts = []
@@ -594,42 +886,28 @@ def create_app(discovery=None, updater=None) -> Flask:
                                        % entry.get("rel_path"))
                 source_parts.append(parts)
             planned = _plan_local_paths(source_parts, dest)
-            for entry, parts in zip(entries, planned):
-                target = dest.joinpath(*parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                resp = _peer_request(
+
+            def fetch(entry, offset):
+                headers = {"Range": "bytes=%d-" % offset} if offset else {}
+                return _peer_request(
                     peer, "GET", "/api/clipboard/file/%s/%d"
                     % (manifest["clipboard_id"], entry["index"]),
                     discovery=discovery, stream=True,
-                    timeout=TRANSFER_TIMEOUT)
-                if resp.status_code == 410:
-                    raise RuntimeError("peer clipboard changed during paste")
-                resp.raise_for_status()
-                try:
-                    with open(target, "wb") as fh:
-                        for chunk in resp.iter_content(CHUNK_SIZE):
-                            if chunk:
-                                fh.write(chunk)
-                except BaseException:
-                    try:
-                        target.unlink()
-                    except OSError:
-                        pass
-                    raise
-                finally:
-                    resp.close()
-                written.append(target)
-                total_bytes += target.stat().st_size
+                    timeout=TRANSFER_TIMEOUT, headers=headers)
+
+            transfer_id = "clipboard:%s:%s" % (
+                peer.get("id") or peer.get("host"), manifest["clipboard_id"])
+            written, total_bytes = transfer.download_files(
+                entries, planned, dest, transfer_id, fetch,
+                registry_dir=config.resume_registry_dir(),
+                metadata=_resume_metadata_for_clipboard(peer, manifest))
         except Exception as exc:
-            for path in written:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            bus.publish("resumes")
             log.warning("paste from %s failed: %s", peer.get("name"), exc)
             if isinstance(exc, PeerUnreachable):
                 return _error(str(exc), 502)
-            return _error("transfer failed: %s" % _friendly_error(exc), 502)
+            return _error("transfer interrupted: %s. Retry paste to resume."
+                          % _friendly_error(exc), 502)
 
         _notify_consumed(peer, manifest["clipboard_id"], discovery)
 
@@ -667,10 +945,13 @@ def create_app(discovery=None, updater=None) -> Flask:
                 name = os.path.basename(upload.filename.replace("\\", "/")) or "upload"
                 target = _unique_path(stage / name)
                 upload.save(str(target))
+                snapshot = transfer.source_snapshot(target)
                 files.append({
                     "index": len(files),
                     "rel_path": target.name,
-                    "size": target.stat().st_size,
+                    "size": snapshot["size"],
+                    "sha256": snapshot["sha256"],
+                    "mtime_ns": snapshot["mtime_ns"],
                     "source_path": str(target),
                 })
         except Exception as exc:
@@ -795,12 +1076,16 @@ def create_app(discovery=None, updater=None) -> Flask:
 
         try:
             written, total_bytes = offers.pull_files(offer, dest)
-        except RuntimeError as exc:
-            offers.report_result(offer, "failed")  # best effort
-            offers.manager.set_incoming_status(offer_id, "failed")
-            log.warning("offer %s from %s failed: %s", offer_id,
+        except transfer.TransferError as exc:
+            # Keep both sides active: the next Accept resumes the saved
+            # partial bytes instead of forcing the sender to create a new
+            # offer or retransmitting completed files.
+            offers.manager.set_incoming_status(offer_id, "pending")
+            bus.publish("resumes")
+            log.warning("offer %s from %s interrupted: %s", offer_id,
                         sender.get("name"), exc)
-            return _error("transfer failed: %s" % exc, 502)
+            return _error("transfer interrupted: %s. Accept again to resume."
+                          % exc, 502)
 
         offers.report_result(offer, "completed")  # best effort
         offers.manager.set_incoming_status(offer_id, "completed")

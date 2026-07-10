@@ -462,7 +462,8 @@ class WidgetApp(object):
 
         def work():
             ok, res = api_post("/api/send",
-                               {"peer_id": peer["id"], "paths": paths})
+                               {"peer_id": peer["id"], "paths": paths},
+                               timeout=3600)
             if not ok:
                 notify("Cross Copy", "Send failed: %s"
                        % (res.get("error") or "daemon error"))
@@ -494,6 +495,22 @@ class WidgetApp(object):
             if not ok:
                 notify("cross-copy", "Could not %s offer: %s"
                        % (action, res.get("error") or "daemon error"))
+            self.refresh_menu()
+        self._in_thread(work)
+
+    def partial_transfer_action(self, session_id, action):
+        def work():
+            ok, result = api_post(
+                "/api/resumes/%s/%s" % (session_id, action), timeout=86400)
+            if ok:
+                if action == "resume":
+                    notify("Cross Copy", "Transfer resumed and verified.")
+                else:
+                    notify("Cross Copy", "Partial files removed.")
+            else:
+                notify("Cross Copy", "%s failed: %s" % (
+                    "Resume" if action == "resume" else "Remove",
+                    result.get("error") or "daemon error"))
             self.refresh_menu()
         self._in_thread(work)
 
@@ -693,6 +710,34 @@ class WidgetApp(object):
                           self._bind(self.offer_action, oid, "accept")),
                      Item("Decline",
                           self._bind(self.offer_action, oid, "decline")))))
+
+        resume_data = api_get("/api/resumes", timeout=10) or {}
+        resumes = resume_data.get("resumes") or []
+        if resumes:
+            items.append(Menu.SEPARATOR)
+            resume_items = []
+            for session in resumes:
+                received = int(session.get("received_bytes") or 0)
+                total = int(session.get("total_bytes") or 0)
+                percent = int(round(100.0 * received / total)) if total else 0
+                source = ((session.get("source") or {}).get("name")
+                          or "unknown device")
+                label = "%s — %d%%" % (source, percent)
+                if not session.get("available"):
+                    label += " (unavailable)"
+                sid = session.get("id") or ""
+                resume_items.append(Item(
+                    label,
+                    Menu(Item(
+                        "Resume",
+                        self._bind(self.partial_transfer_action, sid, "resume"),
+                        enabled=bool(session.get("available"))),
+                         Item(
+                             "Remove partial files",
+                             self._bind(self.partial_transfer_action,
+                                        sid, "remove")))))
+            items.append(Item("Incomplete transfers (%d)" % len(resumes),
+                              Menu(*resume_items)))
         items += [
             Menu.SEPARATOR,
             Item("Open panel", self._bind(self.open_panel)),
