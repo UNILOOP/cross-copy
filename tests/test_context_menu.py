@@ -1,14 +1,16 @@
 import os
+import io
 import plistlib
 import stat
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from crosscopy import cli, contextmenu
+from crosscopy import cli, contextmenu, popup
 
 
 class Response:
@@ -36,15 +38,41 @@ class FakeRegistryKey:
 class FakeWinreg:
     HKEY_CURRENT_USER = "HKCU"
     REG_SZ = 1
+    KEY_READ = 1
 
     def __init__(self):
         self.values = {}
+        self.keys = set()
 
     def CreateKey(self, _root, path):
+        parts = path.split("\\")
+        for index in range(1, len(parts) + 1):
+            self.keys.add("\\".join(parts[:index]))
         return FakeRegistryKey(self, path)
 
     def SetValueEx(self, key, name, _reserved, _kind, value):
         self.values[(key.path, name)] = value
+
+    def OpenKey(self, _root, path, _reserved, _access):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return FakeRegistryKey(self, path)
+
+    def EnumKey(self, key, index):
+        prefix = key.path + "\\"
+        children = sorted({path[len(prefix):].split("\\", 1)[0]
+                           for path in self.keys if path.startswith(prefix)})
+        if index >= len(children):
+            raise OSError("no more keys")
+        return children[index]
+
+    def DeleteKey(self, _root, path):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        self.keys.remove(path)
+        for key in list(self.values):
+            if key[0] == path:
+                self.values.pop(key)
 
 
 class ContextMenuTests(unittest.TestCase):
@@ -52,8 +80,12 @@ class ContextMenuTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             paths = contextmenu.install(platform="darwin", home=home)
             self.assertEqual(2, len(paths))
-            documents = [plistlib.loads(Path(path).read_bytes())
+            documents = [plistlib.loads(
+                (Path(path) / "Contents/Resources/document.wflow").read_bytes())
                          for path in paths]
+            infos = [plistlib.loads(
+                (Path(path) / "Contents/Info.plist").read_bytes())
+                     for path in paths]
             commands = [document["actions"][0]["action"]
                         ["ActionParameters"]["COMMAND_STRING"]
                         for document in documents]
@@ -65,8 +97,17 @@ class ContextMenuTests(unittest.TestCase):
                 metadata = document["workflowMetaData"]
                 self.assertEqual("com.apple.finder",
                                  metadata["serviceApplicationBundleID"])
+                self.assertEqual("com.apple.Automator.servicesMenu",
+                                 metadata["workflowTypeIdentifier"])
                 self.assertEqual(1, document["actions"][0]["action"]
                                  ["ActionParameters"]["inputMethod"])
+            for info in infos:
+                service = info["NSServices"][0]
+                self.assertEqual("runWorkflowAsService",
+                                 service["NSMessage"])
+                self.assertIn("public.item", service["NSSendFileTypes"])
+                self.assertIn("Cross Copy/",
+                              service["NSMenuItem"]["default"])
             removed = contextmenu.uninstall(platform="darwin", home=home)
             self.assertEqual(2, len(removed))
             self.assertTrue(all(not Path(path).exists() for path in paths))
@@ -96,6 +137,8 @@ class ContextMenuTests(unittest.TestCase):
             contextmenu.uninstall(platform="linux", home=home)
             self.assertEqual("keep", unrelated.read_text(encoding="utf-8"))
             self.assertTrue(all(not menu.exists() for menu in menus))
+            self.assertTrue(all(not script.exists() for script in scripts
+                                if script != unrelated))
 
     def test_windows_menu_command_is_hidden_launcher_multiselect(self):
         launcher = r"C:\Program Files\Cross Copy\Cross Copy.exe"
@@ -125,6 +168,12 @@ class ContextMenuTests(unittest.TestCase):
         self.assertTrue(any("context share-all" in item for item in commands))
         self.assertTrue(any("context share-to" in item for item in commands))
         self.assertEqual(["registry:HKCU\\" + root], locations)
+        with mock.patch.dict(sys.modules, {"winreg": registry}):
+            removed = contextmenu.uninstall(platform="win32",
+                                            home="C:\\Users\\A")
+        self.assertEqual(locations, removed)
+        self.assertFalse(any(path == root or path.startswith(root + "\\")
+                             for path in registry.keys))
 
     def test_selected_paths_supports_arguments_and_file_manager_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -178,6 +227,48 @@ class ContextMenuTests(unittest.TestCase):
                 cli.cmd_context(args)
             self.assertEqual("/api/send", post.call_args.args[0])
             self.assertEqual("peer-1", post.call_args.args[1]["peer_id"])
+
+    def test_no_devices_uses_cross_copy_popup_with_panel_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "photo.jpg")
+            path.write_bytes(b"jpg")
+            args = SimpleNamespace(
+                context_action="share-to", paths=[str(path)], to=None)
+            with mock.patch.object(cli, "ensure_daemon"), \
+                    mock.patch.object(cli, "api_get",
+                                      return_value=Response({"peers": []})), \
+                    mock.patch.object(cli, "_context_notify") as notify:
+                with self.assertRaises(SystemExit):
+                    cli.cmd_context(args)
+            notify.assert_called_once_with(
+                "Cross Copy", "No Cross Copy devices are currently available.",
+                show_panel=True)
+
+    def test_actionable_popup_show_opens_widget_panel(self):
+        output = io.StringIO()
+        args = SimpleNamespace(
+            mode="info", title="Cross Copy",
+            body="No Cross Copy devices are currently available.",
+            slot=0, show_panel=True)
+        with redirect_stdout(output):
+            popup.dry_run(args)
+        rendered = output.getvalue()
+        self.assertIn('"buttons": [', rendered)
+        self.assertIn('"Show"', rendered)
+        with mock.patch.object(cli.subprocess, "Popen") as process:
+            cli._context_notify("Cross Copy", "No devices",
+                                show_panel=True)
+        command = process.call_args.args[0]
+        self.assertIn("crosscopy.popup", command)
+        self.assertIn("--show-panel", command)
+        with mock.patch.object(popup.sys, "platform", "darwin"), \
+                mock.patch.object(popup.subprocess, "Popen") as panel:
+            panel.return_value.wait.side_effect = popup.subprocess.TimeoutExpired(
+                "macpanel", 0.6)
+            self.assertTrue(popup.open_widget_panel())
+        panel_command = panel.call_args.args[0]
+        self.assertIn("crosscopy.macpanel", panel_command)
+        self.assertTrue(panel.call_args.kwargs["start_new_session"])
 
     def test_cli_and_installers_expose_context_lifecycle(self):
         parsed = cli.build_parser().parse_args(

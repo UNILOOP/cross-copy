@@ -205,6 +205,10 @@ ccp context install
 ccp context uninstall
 ```
 
+If a context action cannot find another device, Cross Copy shows its own
+notification card. The card's **Show** button opens the compact Cross Copy
+panel; it does not hand the click to Finder, Automator, or Script Editor.
+
 ## Send to a specific computer
 
 The regular clipboard is available to any connected computer. When you want
@@ -493,6 +497,18 @@ again.
 Run `ccp widget` in a terminal. On GNOME, verify that AppIndicator support is
 installed and enabled.
 
+### Finder does not show the Cross Copy Quick Actions
+
+Repair the workflow bundles and refresh macOS Services with:
+
+```sh
+ccp context install
+```
+
+Then open Finder's **Quick Actions** or **Services** submenu again. If the
+actions were disabled manually, open **System Settings**, go to **General ›
+Login Items & Extensions › Finder**, and enable the Cross Copy actions.
+
 ### Test two instances on one computer
 
 Use separate data directories and ports:
@@ -543,7 +559,7 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.6.0 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.6.2 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
 send offers. Recovery details and controls, including destination paths and

@@ -24,6 +24,29 @@ jobs:
         run: python -m pip install ".[widget]"
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Smoke test context-action lifecycle (macOS and Linux)
+        if: runner.os != 'Windows' && matrix.python == '3.14'
+        shell: bash
+        run: |
+          export HOME="$RUNNER_TEMP/crosscopy-context-home"
+          export CROSSCOPY_SKIP_SERVICE_REFRESH=1
+          mkdir -p "$HOME"
+          ccp context install
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            test -f "$HOME/Library/Services/Cross Copy - Share to All.workflow/Contents/Info.plist"
+            test -f "$HOME/Library/Services/Cross Copy - Share to All.workflow/Contents/Resources/document.wflow"
+            test -f "$HOME/Library/Services/Cross Copy - Share to Device.workflow/Contents/Info.plist"
+          else
+            test -x "$HOME/.local/share/nautilus/scripts/Cross Copy/Share to all devices"
+            test -x "$HOME/.local/share/nemo/scripts/Cross Copy/Share to a device…"
+            test -x "$HOME/.config/caja/scripts/Cross Copy/Share to all devices"
+            test -x "$HOME/.local/share/kio/servicemenus/cross-copy.desktop"
+          fi
+          ccp context uninstall
+          if find "$HOME" -iname '*cross*copy*' -print -quit | grep -q .; then
+            echo "Cross Copy context artifacts survived uninstall" >&2
+            exit 1
+          fi
       - name: Validate PowerShell installers
         if: runner.os == 'Windows'
         shell: pwsh
@@ -64,6 +87,8 @@ jobs:
           if ($identity.ProductVersion -ne $ping.version) { throw "daemon executable version does not match package version" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue)) { throw "daemon Run entry missing" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue)) { throw "widget Run entry missing" }
+          $contextKey = "HKCU:\Software\Classes\AllFilesystemObjects\shell\CrossCopy"
+          if (-not (Test-Path $contextKey)) { throw "Explorer context menu is missing" }
           & .\uninstall.ps1 -RemoveData
           if (Test-Path (Join-Path $env:LOCALAPPDATA "CrossCopy")) { throw "install root survived uninstall" }
           if (Test-Path $env:CROSSCOPY_HOME) { throw "data directory survived uninstall" }
@@ -71,6 +96,7 @@ jobs:
           if (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue) { throw "widget survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue) { throw "daemon Run entry survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue) { throw "widget Run entry survived uninstall" }
+          if (Test-Path $contextKey) { throw "Explorer context menu survived uninstall" }
           if (@([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") }).Count) { throw "Cross Copy survived in user PATH" }
       - name: Smoke test installer lifecycle (PowerShell 7)
         if: runner.os == 'Windows' && matrix.python == '3.14'
@@ -98,6 +124,8 @@ jobs:
           if ($identity.ProductVersion -ne $ping.version) { throw "daemon executable version does not match package version" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue)) { throw "daemon Run entry missing" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue)) { throw "widget Run entry missing" }
+          $contextKey = "HKCU:\Software\Classes\AllFilesystemObjects\shell\CrossCopy"
+          if (-not (Test-Path $contextKey)) { throw "Explorer context menu is missing" }
           & .\uninstall.ps1 -RemoveData
           if (Test-Path (Join-Path $env:LOCALAPPDATA "CrossCopy")) { throw "install root survived uninstall" }
           if (Test-Path $env:CROSSCOPY_HOME) { throw "data directory survived uninstall" }
@@ -105,4 +133,5 @@ jobs:
           if (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue) { throw "widget survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue) { throw "daemon Run entry survived uninstall" }
           if (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue) { throw "widget Run entry survived uninstall" }
+          if (Test-Path $contextKey) { throw "Explorer context menu survived uninstall" }
           if (@([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_.TrimEnd("\") -ieq $bin.TrimEnd("\") }).Count) { throw "Cross Copy survived in user PATH" }

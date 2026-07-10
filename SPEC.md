@@ -100,6 +100,12 @@ field (the full string, UTF-8, max 1 MB — reject larger with 400), no `files` 
   uses the no-console branded launcher.
 - `ccp context install|uninstall` owns the lifecycle. `share-all` and
   `share-to [--to peer]` are supported invocation actions used by native registrations.
+- Context-action errors use `crosscopy.popup info --show-panel`, not an AppleScript-owned
+  notification. Its **Show** button opens `/widget` through the native macOS panel (or the
+  browser fallback on other platforms), so notification clicks remain owned by Cross Copy.
+- CI performs install→artifact assertions→uninstall assertions on macOS, Linux, Windows
+  PowerShell 5.1, and Windows PowerShell 7. Windows checks the real per-user registry key;
+  macOS/Linux checks the installed workflow/script/service-menu files.
 
 ## Reciprocal discovery — "hello" (v0.3)
 

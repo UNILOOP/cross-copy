@@ -28,10 +28,12 @@ stdlib only (tkinter + urllib), plus PyObjC on macOS.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import urllib.error
 import urllib.request
+import webbrowser
 
 DEFAULT_PORT = 7373
 
@@ -39,6 +41,7 @@ DEFAULT_PORT = 7373
 WIDTH = 340
 HEIGHT_OFFER = 132
 HEIGHT_INFO = 88
+HEIGHT_INFO_ACTION = 118
 MARGIN = 16          # gap from the screen's top/right edges
 GAP = 12             # vertical gap between stacked cards
 RADIUS = 16
@@ -47,6 +50,7 @@ RADIUS = 16
 MAC_WIDTH = 360
 MAC_HEIGHT_OFFER = 150
 MAC_HEIGHT_INFO = 96
+MAC_HEIGHT_INFO_ACTION = 132
 MAC_RADIUS = 14.0
 
 # Liquid-glass-inspired palette (within tkinter's limits: flat dark card,
@@ -162,6 +166,27 @@ def saved_message(res, fallback_dest=None):
     if files:
         return "Saved to %s" % os.path.dirname(files[0])
     return "Saved to %s" % (fallback_dest or "receive folder")
+
+
+def open_widget_panel():
+    """Open the compact local panel without involving a notification host."""
+    url = "http://127.0.0.1:%d/widget" % daemon_port()
+    if sys.platform == "darwin":
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "crosscopy.macpanel", url],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                process.wait(timeout=0.6)
+            except subprocess.TimeoutExpired:
+                return True
+        except OSError:
+            pass
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 def slot_offset(slot, step=None):
@@ -401,12 +426,24 @@ def run_share(peer_id, clipboard_id, from_name, summary, kind, slot):
     return 0
 
 
-def run_info(title, body, slot):
-    ui = Popup(HEIGHT_INFO, slot)
+def run_info(title, body, slot, show_panel=False):
+    height = HEIGHT_INFO_ACTION if show_panel else HEIGHT_INFO
+    ui = Popup(height, slot)
     ui.label(18, 16, title, size=12, bold=True)
     ui.label(18, 40, body, color=MUTED, size=10)
-    ui.canvas.bind("<Button-1>", lambda e: ui.close())
-    ui.root.bind("<Button-1>", lambda e: ui.close())
+    if show_panel:
+        def show():
+            open_widget_panel()
+            ui.close()
+
+        dismiss = ui.button("Dismiss", ui.close)
+        show_button = ui.button("Show", show, primary=True)
+        dismiss.place(x=WIDTH - 178, y=height - 42, width=76, height=26)
+        show_button.place(x=WIDTH - 98, y=height - 42,
+                          width=80, height=26)
+    else:
+        ui.canvas.bind("<Button-1>", lambda e: ui.close())
+        ui.root.bind("<Button-1>", lambda e: ui.close())
     ui.root.after(INFO_TIMEOUT_MS, ui.close)
     ui.run()
     return 0
@@ -421,7 +458,7 @@ def run_tk(args):
     if args.mode == "share":
         return run_share(args.peer_id, args.clipboard_id, args.from_name,
                          args.summary, args.kind, args.slot)
-    return run_info(args.title, args.body, args.slot)
+    return run_info(args.title, args.body, args.slot, args.show_panel)
 
 
 # ---------------------------------------------------------------------------
@@ -788,10 +825,19 @@ def run_mac(args):
         return 0
 
     def mac_info():
-        card = MacCard(MAC_HEIGHT_INFO, slot, click_dismiss=True)
+        height = MAC_HEIGHT_INFO_ACTION if args.show_panel else MAC_HEIGHT_INFO
+        card = MacCard(height, slot, click_dismiss=not args.show_panel)
         card.label(18, 14, MAC_WIDTH - 36, 20, args.title, size=13, bold=True)
         card.label(18, 38, MAC_WIDTH - 36, 40, args.body, color=MUTED,
                    size=11, wraps=True)
+        if args.show_panel:
+            def show():
+                open_widget_panel()
+                close_app()
+
+            card.button("Dismiss", close_app, MAC_WIDTH - 192, width=86)
+            card.button("Show", show, MAC_WIDTH - 102, width=88,
+                        primary=True)
         start_timer(INFO_TIMEOUT_MS / 1000.0, close_app)
         card.show()
         app.run()
@@ -874,8 +920,9 @@ def dry_run(args):
             "dest": receive_dir() if args.kind != "text" else None,
         }
     else:
-        height = HEIGHT_INFO
-        content = {"title": args.title, "body": args.body, "buttons": []}
+        height = HEIGHT_INFO_ACTION if args.show_panel else HEIGHT_INFO
+        content = {"title": args.title, "body": args.body,
+                   "buttons": ["Dismiss", "Show"] if args.show_panel else []}
     w, h, x, y = geometry(height, args.slot, screen_w, screen_h)
     print(json.dumps({"mode": args.mode, "slot": args.slot,
                       "geometry": {"w": w, "h": h, "x": x, "y": y},
@@ -894,6 +941,7 @@ def main(argv=None):
     p = sub.add_parser("info")
     p.add_argument("title")
     p.add_argument("body")
+    p.add_argument("--show-panel", action="store_true")
     p = sub.add_parser("share")
     p.add_argument("peer_id")
     p.add_argument("clipboard_id")
@@ -929,6 +977,8 @@ def main(argv=None):
 
     for msg in errors:  # stderr lands in widget.log via spawn_popup
         print("crosscopy.popup: %s" % msg, file=sys.stderr)
+    if args.mode == "info" and args.show_panel and open_widget_panel():
+        return 0
     text = fallback_text(args)
     if text and fallback_os_notification(*text):
         print("crosscopy.popup: fell back to an OS notification",

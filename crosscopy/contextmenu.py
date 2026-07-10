@@ -97,20 +97,76 @@ def _mac_workflow(action):
                 "com.apple.Automator.fileSystemObject"),
             "serviceOutputTypeIdentifier": "com.apple.Automator.nothing",
             "serviceProcessesInput": 0,
+            "workflowTypeIdentifier": "com.apple.Automator.servicesMenu",
         },
     }
     return plistlib.dumps(workflow, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def _mac_info(action):
+    if action == ACTION_ALL:
+        identifier = "com.uniloop.crosscopy.quickaction.share-all"
+        name = "Share to all devices"
+    else:
+        identifier = "com.uniloop.crosscopy.quickaction.share-to"
+        name = "Share to a device…"
+    info = {
+        "CFBundleDevelopmentRegion": "en",
+        "CFBundleIdentifier": identifier,
+        "CFBundleName": "Cross Copy - " + name,
+        "CFBundleShortVersionString": "1.0",
+        "NSServices": [{
+            "NSMenuItem": {"default": "Cross Copy/" + name},
+            "NSMessage": "runWorkflowAsService",
+            "NSRequiredContext": {
+                "NSApplicationIdentifier": "com.apple.finder",
+            },
+            "NSSendFileTypes": ["public.item"],
+            "NSSendTypes": ["NSFilenamesPboardType"],
+        }],
+    }
+    return plistlib.dumps(info, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def _refresh_macos_services(home):
+    if os.environ.get("CROSSCOPY_SKIP_SERVICE_REFRESH") == "1":
+        return
+    if sys.platform != "darwin" or home.resolve() != Path.home().resolve():
+        return
+    pbs = Path("/System/Library/CoreServices/pbs")
+    if not pbs.exists():
+        return
+    for action in ("-flush", "-update"):
+        try:
+            subprocess.run([str(pbs), action], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _install_macos(home):
     services = home / "Library/Services"
     installed = []
     for name, action in MAC_WORKFLOWS:
-        contents = services / name / "Contents"
-        contents.mkdir(parents=True, exist_ok=True)
-        document = contents / "document.wflow"
+        workflow = services / name
+        if workflow.is_symlink() or (workflow.exists()
+                                     and not workflow.is_dir()):
+            workflow.unlink()
+        contents = workflow / "Contents"
+        resources = contents / "Resources"
+        resources.mkdir(parents=True, exist_ok=True)
+        document = resources / "document.wflow"
         document.write_bytes(_mac_workflow(action))
-        installed.append(document)
+        (contents / "Info.plist").write_bytes(_mac_info(action))
+        # Remove the pre-0.6.1 layout, which macOS parses as a plist but does
+        # not register as an NSServices bundle.
+        legacy_document = contents / "document.wflow"
+        try:
+            legacy_document.unlink()
+        except FileNotFoundError:
+            pass
+        installed.append(workflow)
+    _refresh_macos_services(home)
     return installed
 
 
@@ -218,9 +274,13 @@ def _uninstall_macos(home):
     removed = []
     for name, _action in MAC_WORKFLOWS:
         workflow = home / "Library/Services" / name
-        if workflow.exists():
+        if workflow.is_symlink():
+            workflow.unlink()
+            removed.append(workflow)
+        elif workflow.exists():
             shutil.rmtree(workflow)
             removed.append(workflow)
+    _refresh_macos_services(home)
     return removed
 
 

@@ -893,8 +893,17 @@ def cmd_transfers(args):
     print("Remove partial files with: ccp transfers --remove <id>")
 
 
-def _context_notify(title, message):
+def _context_notify(title, message, show_panel=False):
     try:
+        if show_panel:
+            from crosscopy.windows import background_popen_kwargs
+            command = [sys.executable, "-m", "crosscopy.popup", "info",
+                       str(title), str(message), "--show-panel"]
+            subprocess.Popen(
+                command, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                **background_popen_kwargs())
+            return
         from crosscopy.notify import notify
         notify(title, message)
     except Exception:
@@ -902,7 +911,7 @@ def _context_notify(title, message):
 
 
 def _context_fail(message):
-    _context_notify("Cross Copy", message)
+    _context_notify("Cross Copy", message, show_panel=True)
     die(message)
 
 
