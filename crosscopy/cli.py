@@ -233,8 +233,12 @@ def spawn_daemon():
     os.makedirs(home, exist_ok=True)
     log = open(os.path.join(home, "daemon.log"), "ab")
     try:
+        executable = sys.executable
+        if sys.platform == "win32":
+            from crosscopy.windows import make_windows_launcher
+            executable = make_windows_launcher()
         subprocess.Popen(
-            [sys.executable, "-m", "crosscopy.daemon"],
+            [executable, "-m", "crosscopy.daemon"],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
@@ -1806,7 +1810,11 @@ def cmd_daemon(args):
             os.chdir(os.path.expanduser("~"))
         except OSError:
             pass
-        os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
+        executable = sys.executable
+        if sys.platform == "win32":
+            from crosscopy.windows import make_windows_launcher
+            executable = make_windows_launcher()
+        os.execv(executable, [executable, "-m", "crosscopy.daemon"])
     elif action == "start":
         info = ping()
         if info:

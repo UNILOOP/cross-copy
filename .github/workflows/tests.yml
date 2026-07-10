@@ -57,6 +57,11 @@ jobs:
           $widgetInfo = Get-Content (Join-Path $env:CROSSCOPY_HOME "widget.json") | ConvertFrom-Json
           if (-not (Get-Process -Id $daemonInfo.pid -ErrorAction SilentlyContinue)) { throw "daemon process is not running" }
           if (-not (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue)) { throw "widget process is not running" }
+          $daemonProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($daemonInfo.pid)"
+          if ([IO.Path]::GetFileName($daemonProcess.ExecutablePath) -notlike "Cross Copy*.exe") { throw "daemon is running as $($daemonProcess.ExecutablePath), not Cross Copy" }
+          $identity = [Diagnostics.FileVersionInfo]::GetVersionInfo($daemonProcess.ExecutablePath)
+          if ($identity.FileDescription -ne "Cross Copy" -or $identity.ProductName -ne "Cross Copy") { throw "daemon executable is not branded as Cross Copy" }
+          if ($identity.ProductVersion -ne $ping.version) { throw "daemon executable version does not match package version" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue)) { throw "daemon Run entry missing" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue)) { throw "widget Run entry missing" }
           & .\uninstall.ps1 -RemoveData
@@ -86,6 +91,11 @@ jobs:
           $widgetInfo = Get-Content (Join-Path $env:CROSSCOPY_HOME "widget.json") | ConvertFrom-Json
           if (-not (Get-Process -Id $daemonInfo.pid -ErrorAction SilentlyContinue)) { throw "daemon process is not running" }
           if (-not (Get-Process -Id $widgetInfo.pid -ErrorAction SilentlyContinue)) { throw "widget process is not running" }
+          $daemonProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($daemonInfo.pid)"
+          if ([IO.Path]::GetFileName($daemonProcess.ExecutablePath) -notlike "Cross Copy*.exe") { throw "daemon is running as $($daemonProcess.ExecutablePath), not Cross Copy" }
+          $identity = [Diagnostics.FileVersionInfo]::GetVersionInfo($daemonProcess.ExecutablePath)
+          if ($identity.FileDescription -ne "Cross Copy" -or $identity.ProductName -ne "Cross Copy") { throw "daemon executable is not branded as Cross Copy" }
+          if ($identity.ProductVersion -ne $ping.version) { throw "daemon executable version does not match package version" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue)) { throw "daemon Run entry missing" }
           if (-not (Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "Cross Copy Widget" -ErrorAction SilentlyContinue)) { throw "widget Run entry missing" }
           & .\uninstall.ps1 -RemoveData

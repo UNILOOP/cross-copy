@@ -11,6 +11,7 @@ from unittest import mock
 
 from crosscopy import (cli, config, daemon, notify, offers, popup, widget,
                        windows, winnotify)
+from crosscopy import __version__
 
 
 class WindowsSupportTests(unittest.TestCase):
@@ -35,6 +36,7 @@ class WindowsSupportTests(unittest.TestCase):
                     mock.patch.object(windows.sys, "prefix", root), \
                     mock.patch.object(windows.sys, "base_prefix",
                                       os.path.join(root, "base")), \
+                    mock.patch.object(windows, "brand_windows_executable"), \
                     mock.patch.dict(os.environ, env, clear=False), \
                     mock.patch.dict(sys.modules, {"winreg": winreg}):
                 path = windows.write_startup_launcher(
@@ -52,6 +54,129 @@ class WindowsSupportTests(unittest.TestCase):
             registry_command = winreg.SetValueEx.call_args.args[-1]
             self.assertIn("Cross Copy.exe", registry_command)
             self.assertIn("Cross Copy Daemon.pyw", registry_command)
+
+    def test_version_resource_identifies_cross_copy(self):
+        resource = windows.windows_version_resource(__version__)
+        length, value_length, value_type = windows.struct.unpack_from(
+            "<HHH", resource)
+        self.assertEqual(len(resource), length)
+        self.assertEqual(52, value_length)
+        self.assertEqual(0, value_type)
+        self.assertIn(windows.struct.pack("<I", 0xFEEF04BD), resource)
+        for value in ("Cross Copy", "UNILOOP LLC", __version__):
+            self.assertIn(value.encode("utf-16le"), resource)
+
+    def test_windows_launcher_is_branded_once_per_version(self):
+        with tempfile.TemporaryDirectory() as root:
+            scripts = os.path.join(root, "venv", "Scripts")
+            os.makedirs(scripts)
+            pythonw = os.path.join(scripts, "pythonw.exe")
+            Path(pythonw).write_bytes(b"pythonw")
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.sys, "executable", pythonw), \
+                    mock.patch.object(windows.sys, "prefix", scripts), \
+                    mock.patch.object(windows.sys, "base_prefix", root), \
+                    mock.patch.object(windows, "brand_windows_executable") \
+                    as brand:
+                first = windows.make_windows_launcher()
+                second = windows.make_windows_launcher()
+            self.assertEqual(os.path.join(scripts, "Cross Copy.exe"), first)
+            self.assertEqual(first, second)
+            brand.assert_called_once_with(first, __version__)
+            self.assertEqual(
+                __version__, Path(first + ".crosscopy-version").read_text(
+                    encoding="ascii").strip())
+
+    def test_locked_windows_launcher_gets_versioned_replacement(self):
+        with tempfile.TemporaryDirectory() as root:
+            scripts = os.path.join(root, "venv", "Scripts")
+            os.makedirs(scripts)
+            pythonw = os.path.join(scripts, "pythonw.exe")
+            Path(pythonw).write_bytes(b"pythonw")
+
+            def brand(path, _version):
+                if os.path.basename(path) == "Cross Copy.exe":
+                    raise PermissionError("locked")
+
+            with mock.patch.object(windows.sys, "platform", "win32"), \
+                    mock.patch.object(windows.sys, "executable", pythonw), \
+                    mock.patch.object(windows.sys, "prefix", scripts), \
+                    mock.patch.object(windows.sys, "base_prefix", root), \
+                    mock.patch.object(windows, "brand_windows_executable",
+                                      side_effect=brand):
+                launcher = windows.make_windows_launcher()
+            self.assertEqual(
+                os.path.join(scripts, "Cross Copy %s.exe" % __version__),
+                launcher)
+
+    @unittest.skipUnless(sys.platform == "win32", "native Windows check")
+    def test_native_windows_launcher_version_info(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = windows.pythonw_executable()
+            target = os.path.join(root, "Cross Copy.exe")
+            windows.shutil.copy2(source, target)
+            windows.brand_windows_executable(target, __version__)
+            env = dict(os.environ, CROSSCOPY_TEST_EXE=target)
+            command = (
+                "$v=[Diagnostics.FileVersionInfo]::GetVersionInfo("
+                "$env:CROSSCOPY_TEST_EXE); "
+                "@($v.FileDescription,$v.ProductName,$v.ProductVersion) "
+                "| ConvertTo-Json -Compress")
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                check=True, capture_output=True, text=True, env=env)
+            self.assertEqual(
+                ["Cross Copy", "Cross Copy", __version__],
+                json.loads(result.stdout))
+
+    def test_cli_daemon_spawn_uses_branded_windows_launcher(self):
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(cli.sys, "platform", "win32"), \
+                mock.patch.object(cli, "crosscopy_home", return_value=home), \
+                mock.patch("crosscopy.windows.make_windows_launcher",
+                           return_value=r"C:\App\Cross Copy.exe"), \
+                mock.patch.object(cli, "background_popen_kwargs",
+                                  return_value={}), \
+                mock.patch.object(cli.subprocess, "Popen") as popen:
+            cli.spawn_daemon()
+        self.assertEqual(
+            [r"C:\App\Cross Copy.exe", "-m", "crosscopy.daemon"],
+            popen.call_args.args[0])
+
+    def test_widget_daemon_spawn_uses_branded_windows_launcher(self):
+        info = {"name": "Windows PC"}
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(widget.sys, "platform", "win32"), \
+                mock.patch.object(widget, "crosscopy_home",
+                                  return_value=home), \
+                mock.patch.object(widget, "ping", side_effect=[None, info]), \
+                mock.patch.object(widget.time, "sleep"), \
+                mock.patch("crosscopy.windows.make_windows_launcher",
+                           return_value=r"C:\App\Cross Copy.exe"), \
+                mock.patch.object(widget, "background_popen_kwargs",
+                                  return_value={}), \
+                mock.patch.object(widget.subprocess, "Popen") as popen:
+            self.assertEqual(info, widget.ensure_daemon())
+        self.assertEqual(
+            [r"C:\App\Cross Copy.exe", "-m", "crosscopy.daemon"],
+            popen.call_args.args[0])
+
+    def test_refresh_startup_commands_only_updates_existing_entries(self):
+        winreg = mock.MagicMock()
+        winreg.HKEY_CURRENT_USER = object()
+        winreg.KEY_QUERY_VALUE = 1
+        winreg.KEY_SET_VALUE = 2
+        winreg.REG_SZ = 1
+        key = winreg.OpenKey.return_value.__enter__.return_value
+        winreg.QueryValueEx.side_effect = [("old", 1), FileNotFoundError()]
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": winreg}):
+            windows.refresh_registered_startup_commands(
+                r"C:\App\Cross Copy 0.5.2.exe")
+        winreg.SetValueEx.assert_called_once()
+        command = winreg.SetValueEx.call_args.args[-1]
+        self.assertIn("Cross Copy 0.5.2.exe", command)
+        self.assertIn("Cross Copy Daemon.pyw", command)
 
     def test_windows_background_process_uses_no_console(self):
         with mock.patch.object(windows.sys, "platform", "win32"), \
@@ -321,6 +446,55 @@ class WindowsSupportTests(unittest.TestCase):
         finally:
             daemon._cleanup_state.clear()
             daemon._cleanup_state.update(original_state)
+
+    def test_windows_auto_update_reexecs_branded_new_version(self):
+        original_state = dict(daemon._cleanup_state)
+        daemon._cleanup_state.update(
+            {"done": False, "discovery": None, "updater": None})
+        launcher = r"C:\App\Cross Copy 0.5.3.exe"
+        try:
+            with mock.patch.object(daemon.sys, "platform", "win32"), \
+                    mock.patch("importlib.metadata.version",
+                               return_value="0.5.3"), \
+                    mock.patch("crosscopy.windows.make_windows_launcher",
+                               return_value=launcher) as make_launcher, \
+                    mock.patch(
+                        "crosscopy.windows.refresh_registered_startup_commands") \
+                    as refresh, \
+                    mock.patch("crosscopy.windows.release_daemon_mutex"), \
+                    mock.patch("crosscopy.cli.restart_widget_after_update"), \
+                    mock.patch.object(daemon.os, "sysconf", return_value=3), \
+                    mock.patch.object(daemon.os, "chdir"), \
+                    mock.patch.object(daemon.os, "execv",
+                                      side_effect=RuntimeError("exec")) as execv:
+                with self.assertRaisesRegex(RuntimeError, "exec"):
+                    daemon._restart_daemon()
+            make_launcher.assert_called_once_with("0.5.3")
+            refresh.assert_called_once_with(launcher)
+            execv.assert_called_once_with(
+                launcher, [launcher, "-m", "crosscopy.daemon"])
+        finally:
+            daemon._cleanup_state.clear()
+            daemon._cleanup_state.update(original_state)
+
+    def test_legacy_windows_daemon_switches_identity_before_binding(self):
+        current = os.path.join("C:\\App", "Cross Copy.exe")
+        replacement = os.path.join("C:\\App", "Cross Copy 0.5.2.exe")
+        with mock.patch.object(daemon.sys, "platform", "win32"), \
+                mock.patch.object(daemon.sys, "executable", current), \
+                mock.patch("crosscopy.windows.make_windows_launcher",
+                           return_value=replacement), \
+                mock.patch(
+                    "crosscopy.windows.refresh_registered_startup_commands") \
+                as refresh, \
+                mock.patch.object(daemon.log, "warning"), \
+                mock.patch.object(daemon.os, "execv",
+                                  side_effect=RuntimeError("exec")) as execv:
+            # The helper logs and returns if execv itself fails.
+            daemon._ensure_windows_executable_identity()
+        refresh.assert_called_once_with(replacement)
+        execv.assert_called_once_with(
+            replacement, [replacement, "-m", "crosscopy.daemon"])
 
 
 if __name__ == "__main__":

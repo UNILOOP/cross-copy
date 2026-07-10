@@ -13,7 +13,7 @@ UX metaphor: `ccp copy file.txt` on machine A, `ccp paste` on machine B — the 
 - **Web UI** (`crosscopy/webui/` — `index.html`, `app.js`, `style.css`): static files served
   by the daemon at `/`. Talks to the local control API via fetch().
 
-Python >= 3.9. Dependencies: `flask`, `requests`, `zeroconf`. Nothing else.
+Python >= 3.9. Dependencies: `flask`, `requests`, `zeroconf>=0.100`. Nothing else.
 
 ## Constants & configuration
 
@@ -91,6 +91,15 @@ reach the other, both end up knowing each other.
 - Peers with `source: "hello"` expire after 10 min without contact. Manual peers never expire.
 - mDNS hardening: register with ALL non-loopback IPv4 addresses and browse/register on all
   interfaces (zeroconf InterfaceChoice.All).
+- Windows network changes are polled every 15 seconds. The daemon rescans
+  zeroconf interfaces on every pass, reannounces once per minute, and rebuilds
+  the mDNS registration when the local IPv4 set changes.
+- A versioned UDP broadcast beacon on port 7374 supplements mDNS. It contains
+  only device metadata and the daemon port; receiving it records the source IP
+  and immediately attempts the normal reciprocal HTTP hello. Directed subnet
+  broadcasts and `255.255.255.255` are both used. `CROSSCOPY_DISCOVERY_PORT`
+  overrides the beacon port. `CROSSCOPY_NO_MDNS=1` disables both mDNS and the
+  broadcast fallback for isolated tests/manual-only operation.
 
 ## Server-sent events (v0.3)
 
@@ -334,7 +343,10 @@ transitions. Must stay dependency-free (pure CSS) and legible (WCAG-ish contrast
 - `ccp add <host> [port]` — add manual peer (when mDNS is blocked).
 - `ccp name <newname>` — set device name.
 - `ccp daemon run|start|stop|status` — `run` foreground, `start` background (detached
-  subprocess of `[sys.executable, "-m", "crosscopy.daemon"]`, stdout/err → `daemon.log`).
+  subprocess of `[executable, "-m", "crosscopy.daemon"]`, stdout/err → `daemon.log`).
+  On Windows, `executable` is a venv-local `Cross Copy.exe` with Cross Copy
+  `VERSIONINFO`; every daemon start and self-restart uses it so Windows Defender
+  Firewall identifies the network listener as Cross Copy rather than Python.
 - `ccp ui` — open `http://localhost:<port>/` in browser (webbrowser module).
 - `ccp version`.
 

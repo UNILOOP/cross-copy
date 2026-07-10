@@ -1,3 +1,3 @@
-"""cross-copy: a network file clipboard for Mac/Linux machines on the same LAN."""
+"""cross-copy: a network clipboard for Windows, macOS, and Linux."""
 
-__version__ = "0.5.0"
+__version__ = "0.5.2"

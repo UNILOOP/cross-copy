@@ -2,7 +2,9 @@
 
 import hashlib
 import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -39,8 +41,146 @@ def console_python_executable(executable=None):
     return candidate if os.path.exists(candidate) else executable
 
 
-def make_windows_launcher():
-    """Create a venv-local pythonw copy named Cross Copy.exe when possible."""
+def _align4(data):
+    data.extend(b"\0" * ((-len(data)) % 4))
+
+
+def _utf16z(value):
+    return str(value).encode("utf-16le") + b"\0\0"
+
+
+def _version_block(key, value=b"", value_length=0, value_type=1,
+                   children=()):
+    """Build one DWORD-aligned VERSIONINFO block."""
+    block = bytearray(b"\0" * 6)
+    block.extend(_utf16z(key))
+    _align4(block)
+    block.extend(value)
+    _align4(block)
+    for child in children:
+        block.extend(child)
+        _align4(block)
+    if len(block) > 0xFFFF:
+        raise ValueError("Windows version resource is too large")
+    struct.pack_into("<HHH", block, 0, len(block), int(value_length),
+                     int(value_type))
+    return bytes(block)
+
+
+def windows_version_resource(version):
+    """Return a VERSIONINFO resource branded for Cross Copy."""
+    numbers = [int(part) for part in re.findall(r"\d+", str(version))[:4]]
+    numbers.extend([0] * (4 - len(numbers)))
+    major, minor, patch, build = numbers
+    version_ms = (major << 16) | minor
+    version_ls = (patch << 16) | build
+    fixed = struct.pack(
+        "<13I",
+        0xFEEF04BD, 0x00010000,
+        version_ms, version_ls, version_ms, version_ls,
+        0x0000003F, 0,
+        0x00040004,  # VOS_NT_WINDOWS32
+        0x00000001,  # VFT_APP
+        0, 0, 0,
+    )
+    text_values = {
+        "CompanyName": "UNILOOP LLC",
+        "FileDescription": "Cross Copy",
+        "FileVersion": "%d.%d.%d.%d" % tuple(numbers),
+        "InternalName": "Cross Copy",
+        "LegalCopyright": "Copyright UNILOOP LLC",
+        "OriginalFilename": "Cross Copy.exe",
+        "ProductName": "Cross Copy",
+        "ProductVersion": str(version),
+    }
+    strings = []
+    for key, text in text_values.items():
+        encoded = _utf16z(text)
+        strings.append(_version_block(
+            key, encoded, value_length=len(text) + 1, value_type=1))
+    string_table = _version_block("040904B0", children=strings)
+    string_file_info = _version_block(
+        "StringFileInfo", children=[string_table])
+    translation = _version_block(
+        "Translation", struct.pack("<HH", 0x0409, 1200),
+        value_length=4, value_type=0)
+    var_file_info = _version_block(
+        "VarFileInfo", children=[translation])
+    return _version_block(
+        "VS_VERSION_INFO", fixed, value_length=len(fixed), value_type=0,
+        children=[string_file_info, var_file_info])
+
+
+def brand_windows_executable(path, version):
+    """Replace executable VERSIONINFO so Windows presents Cross Copy."""
+    if not is_windows():
+        raise RuntimeError("Windows executable branding requires Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    resource = windows_version_resource(version)
+    kernel32 = ctypes.windll.kernel32
+    kernel32.BeginUpdateResourceW.argtypes = [wintypes.LPCWSTR,
+                                               wintypes.BOOL]
+    kernel32.BeginUpdateResourceW.restype = wintypes.HANDLE
+    kernel32.UpdateResourceW.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, wintypes.WORD,
+        ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.UpdateResourceW.restype = wintypes.BOOL
+    kernel32.EndUpdateResourceW.argtypes = [wintypes.HANDLE, wintypes.BOOL]
+    kernel32.EndUpdateResourceW.restype = wintypes.BOOL
+
+    handle = kernel32.BeginUpdateResourceW(os.path.abspath(path), False)
+    if not handle:
+        raise ctypes.WinError(kernel32.GetLastError())
+    buffer = ctypes.create_string_buffer(resource)
+    if not kernel32.UpdateResourceW(
+            handle, ctypes.c_void_p(16), ctypes.c_void_p(1), 0x0409,
+            buffer, len(resource)):
+        error = kernel32.GetLastError()
+        kernel32.EndUpdateResourceW(handle, True)
+        raise ctypes.WinError(error)
+    if not kernel32.EndUpdateResourceW(handle, False):
+        raise ctypes.WinError(kernel32.GetLastError())
+
+
+def _launcher_marker(path):
+    return path + ".crosscopy-version"
+
+
+def _launcher_is_current(path, version):
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(_launcher_marker(path), encoding="ascii") as handle:
+            return handle.read().strip() == str(version)
+    except OSError:
+        return False
+
+
+def _mark_launcher(path, version):
+    marker = _launcher_marker(path)
+    temp = marker + ".tmp"
+    with open(temp, "w", encoding="ascii", newline="\n") as handle:
+        handle.write(str(version) + "\n")
+    os.replace(temp, marker)
+
+
+def _create_branded_launcher(source, target, version):
+    if not os.path.exists(target):
+        shutil.copy2(source, target)
+    brand_windows_executable(target, version)
+    _mark_launcher(target, version)
+    return target
+
+
+def make_windows_launcher(version=None):
+    """Return a venv-local Python GUI interpreter branded as Cross Copy."""
+    if version is None:
+        from . import __version__
+        version = __version__
+
     source = pythonw_executable()
     if os.path.basename(source).lower() != "pythonw.exe":
         raise RuntimeError(
@@ -48,13 +188,19 @@ def make_windows_launcher():
     if sys.prefix == sys.base_prefix:
         return source
     target = os.path.join(os.path.dirname(source), "Cross Copy.exe")
-    if os.path.exists(target):
-        return target  # may be the executable of an already-running daemon
-    try:
-        shutil.copy2(source, target)
+    if _launcher_is_current(target, version):
         return target
+    try:
+        return _create_branded_launcher(source, target, version)
     except OSError:
-        return source
+        # An existing daemon may have Cross Copy.exe locked during an
+        # automatic update. Build a versioned replacement beside it so the
+        # new process and future login entries can switch immediately.
+        fallback = os.path.join(
+            os.path.dirname(source), "Cross Copy %s.exe" % version)
+        if _launcher_is_current(fallback, version):
+            return fallback
+        return _create_branded_launcher(source, fallback, version)
 
 
 def background_popen_kwargs():
@@ -274,6 +420,32 @@ def launch_startup_entry(kind):
         [make_windows_launcher(), startup_launcher_path(kind)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, **background_popen_kwargs())
+
+
+def refresh_registered_startup_commands(executable=None):
+    """Point existing login entries at the current branded executable.
+
+    During an update Windows can keep the running executable locked. The
+    replacement then has a versioned filename, so existing Run entries must
+    follow it for the next login. Entries the user removed are not recreated.
+    """
+    executable = executable or make_windows_launcher()
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_QUERY_VALUE
+                            | winreg.KEY_SET_VALUE) as key:
+            for kind, (entry_name, _filename) in STARTUP_ENTRIES.items():
+                try:
+                    winreg.QueryValueEx(key, entry_name)
+                except FileNotFoundError:
+                    continue
+                command = subprocess.list2cmdline(
+                    [executable, startup_launcher_path(kind)])
+                winreg.SetValueEx(key, entry_name, 0, winreg.REG_SZ, command)
+    except FileNotFoundError:
+        pass
 
 
 def remove_startup_launcher(kind):

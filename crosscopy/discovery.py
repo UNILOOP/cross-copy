@@ -34,13 +34,20 @@ responses carry "clip" (the current clipboard_id) so receivers can publish a
 "peers" event only when the sender's clipboard actually changed.
 
 CROSSCOPY_NO_MDNS=1 disables zeroconf entirely; zeroconf import or
-registration failures are logged and swallowed so the daemon still runs with
-manual + hello peers only.
+registration failures are logged and swallowed. A lightweight UDP broadcast
+beacon complements mDNS on networks where multicast is unreliable, especially
+on Windows. Windows adapters are rescanned periodically so a daemon started
+before Wi-Fi is ready rebinds and reannounces when connectivity appears.
+Setting CROSSCOPY_NO_MDNS=1 disables both automatic mechanisms, leaving manual
++ hello peers only.
 """
 
+import ipaddress
+import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +65,16 @@ PROBE_TIMEOUT = 1.5        # per-candidate reachability probe
 HELLO_TIMEOUT = 2.0
 HELLO_INTERVAL = 60.0      # periodic hello round
 HELLO_EXPIRY = 10 * 60.0   # peers turn suspect after this long without a sighting
+WINDOWS_NETWORK_REFRESH = 15.0  # rescan adapters on Windows
+WINDOWS_MDNS_REANNOUNCE = 60.0
+
+# mDNS is still the primary discovery protocol. This small UDP broadcast
+# beacon is a fallback for Windows networks where multicast membership is
+# unreliable or filtered. It carries metadata only; transfers remain HTTP.
+BEACON_MAGIC = "cross-copy-discovery-v1"
+BEACON_PORT_DEFAULT = 7374
+BEACON_INTERVAL = 15.0
+BEACON_MAX_BYTES = 8192
 
 # Verify-before-drop state machine (see module docstring):
 CONTACT_FRESH = 90.0       # answered contact this recent => never removed
@@ -75,6 +92,15 @@ except Exception as _exc:  # pragma: no cover - import failure path
 
 def mdns_disabled() -> bool:
     return os.environ.get("CROSSCOPY_NO_MDNS") == "1"
+
+
+def beacon_port() -> int:
+    try:
+        port = int(os.environ.get("CROSSCOPY_DISCOVERY_PORT", "")
+                   or BEACON_PORT_DEFAULT)
+    except ValueError:
+        port = BEACON_PORT_DEFAULT
+    return port if 1 <= port <= 65535 else BEACON_PORT_DEFAULT
 
 
 def get_local_ip() -> str:
@@ -114,6 +140,34 @@ def get_local_ips() -> list:
     except Exception:
         pass
     return sorted(ips) or [primary]
+
+
+def get_broadcast_addresses() -> list:
+    """IPv4 limited + directed broadcast addresses for active adapters."""
+    addresses = {"255.255.255.255"}
+    try:
+        import ifaddr
+        for adapter in ifaddr.get_adapters():
+            for item in adapter.ips:
+                raw = item.ip
+                if not isinstance(raw, str) or ":" in raw:
+                    continue
+                prefix = int(item.network_prefix)
+                interface = ipaddress.ip_interface("%s/%d" % (raw, prefix))
+                if (interface.ip.is_loopback or interface.ip.is_unspecified
+                        or interface.ip.is_link_local or prefix >= 31):
+                    continue
+                addresses.add(str(interface.network.broadcast_address))
+    except Exception:
+        pass
+    return sorted(addresses)
+
+
+def mdns_interfaces(local_ips):
+    """Explicit IPv4 bindings on Windows; native all-interface mode elsewhere."""
+    if sys.platform == "win32":
+        return list(local_ips)
+    return InterfaceChoice.All
 
 
 def _current_clip_id() -> str:
@@ -212,6 +266,13 @@ class Discovery:
         self._zeroconf = None
         self._browser = None
         self._service_info = None
+        self._mdns_ips = ()
+        self._last_mdns_announce = 0.0
+        self._mdns_lock = threading.Lock()
+        self._network_thread = None
+        self._beacon_thread = None
+        self._beacon_socket = None
+        self._beacon_wake = threading.Event()
         self._stop = threading.Event()
         self._hello_wake = threading.Event()
         self._hello_thread = None
@@ -224,15 +285,32 @@ class Discovery:
 
     def start(self) -> None:
         if mdns_disabled():
-            log.info("CROSSCOPY_NO_MDNS=1: mDNS discovery disabled")
+            log.info("CROSSCOPY_NO_MDNS=1: automatic discovery disabled")
             return
+        self._start_beacon()
         if not _HAVE_ZEROCONF:
-            log.warning("zeroconf not importable; running without mDNS")
+            log.warning("zeroconf not importable; using broadcast discovery only")
+            return
+        self._start_zeroconf()
+        if sys.platform == "win32" and self._network_thread is None:
+            self._network_thread = threading.Thread(
+                target=self._windows_network_loop,
+                name="crosscopy-network-refresh", daemon=True)
+            self._network_thread.start()
+
+    def _start_zeroconf(self) -> None:
+        """Create mDNS sockets/browser using the adapters available now."""
+        if self._stop.is_set() or mdns_disabled() or not _HAVE_ZEROCONF:
             return
         try:
             # Browse and register on ALL interfaces so multi-homed machines
             # (VPNs, docker bridges, wifi+ethernet) stay discoverable.
-            self._zeroconf = Zeroconf(interfaces=InterfaceChoice.All)
+            local_ips = get_local_ips()
+            with self._mdns_lock:
+                if self._zeroconf is not None:
+                    return
+                self._zeroconf = Zeroconf(
+                    interfaces=mdns_interfaces(local_ips))
             device_id = config.get_device_id()
             props = {
                 "id": device_id,
@@ -241,7 +319,7 @@ class Discovery:
                 "version": __version__,
             }
             addresses = []
-            for ip in get_local_ips():
+            for ip in local_ips:
                 try:
                     addresses.append(socket.inet_aton(ip))
                 except OSError:
@@ -257,11 +335,48 @@ class Discovery:
             )
             self._zeroconf.register_service(self._service_info)
             self._browser = ServiceBrowser(self._zeroconf, SERVICE_TYPE, self)
+            self._mdns_ips = tuple(sorted(local_ips))
+            self._last_mdns_announce = time.monotonic()
             log.info("mDNS: registered %s on port %d (addresses: %s)",
-                     device_id, self.port, ", ".join(get_local_ips()))
+                     device_id, self.port, ", ".join(local_ips))
         except Exception as exc:
             log.warning("mDNS setup failed (%s); running without mDNS", exc)
             self._shutdown_zeroconf()
+
+    def _windows_network_loop(self) -> None:
+        """Keep zeroconf bound to Windows adapters as connectivity changes."""
+        while not self._stop.wait(WINDOWS_NETWORK_REFRESH):
+            try:
+                self._refresh_windows_interfaces()
+            except Exception as exc:
+                log.warning("Windows mDNS interface refresh failed: %s", exc)
+
+    def _refresh_windows_interfaces(self) -> None:
+        """Rescan sockets and reannounce, rebuilding when IPs changed."""
+        if self._stop.is_set() or mdns_disabled() or not _HAVE_ZEROCONF:
+            return
+        current_ips = tuple(sorted(get_local_ips()))
+        zc = self._zeroconf
+        if zc is None:
+            self._start_zeroconf()
+            return
+        if current_ips != self._mdns_ips:
+            log.info("Windows network addresses changed (%s -> %s); "
+                     "restarting mDNS sockets",
+                     ", ".join(self._mdns_ips), ", ".join(current_ips))
+            self._shutdown_zeroconf()
+            self._start_zeroconf()
+            self._beacon_wake.set()
+            return
+        updater = getattr(zc, "update_interfaces", None)
+        if updater is not None:
+            updater(list(current_ips))
+        info = self._service_info
+        now = time.monotonic()
+        if (info is not None
+                and now - self._last_mdns_announce >= WINDOWS_MDNS_REANNOUNCE):
+            zc.update_service(info)
+            self._last_mdns_announce = now
 
     def start_hello(self) -> None:
         """Start the background hello sender loop (works without mDNS)."""
@@ -274,13 +389,22 @@ class Discovery:
     def stop(self) -> None:
         self._stop.set()
         self._hello_wake.set()
+        self._beacon_wake.set()
+        sock = self._beacon_socket
+        self._beacon_socket = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
         self._verify_pool.shutdown(wait=False)
         self._shutdown_zeroconf()
 
     def _shutdown_zeroconf(self) -> None:
-        zc = self._zeroconf
-        self._zeroconf = None
-        self._browser = None
+        with self._mdns_lock:
+            zc = self._zeroconf
+            self._zeroconf = None
+            self._browser = None
         if zc is None:
             return
         try:
@@ -293,6 +417,138 @@ class Discovery:
         except Exception:
             pass
         self._service_info = None
+        self._mdns_ips = ()
+
+    # -- UDP broadcast fallback --------------------------------------------
+
+    def _start_beacon(self) -> None:
+        if self._beacon_thread is not None or self._stop.is_set():
+            return
+        self._beacon_thread = threading.Thread(
+            target=self._beacon_loop, name="crosscopy-beacon", daemon=True)
+        self._beacon_thread.start()
+
+    def _beacon_payload(self) -> bytes:
+        payload = {
+            "magic": BEACON_MAGIC,
+            "id": config.get_device_id(),
+            "name": config.get_device_name(),
+            "platform": config.platform_name(),
+            "version": __version__,
+            "port": self.port,
+            "clip": _current_clip_id(),
+        }
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    def _send_beacon(self, sock) -> None:
+        payload = self._beacon_payload()
+        port = beacon_port()
+        sent = []
+        for address in get_broadcast_addresses():
+            try:
+                sock.sendto(payload, (address, port))
+                sent.append(address)
+            except OSError as exc:
+                log.debug("broadcast beacon to %s:%d failed: %s",
+                          address, port, exc)
+        if sent:
+            log.debug("broadcast beacon sent on %s", ", ".join(sent))
+
+    def _handle_beacon(self, raw, source) -> None:
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict) or data.get("magic") != BEACON_MAGIC:
+                return
+            peer_id = data.get("id")
+            name = data.get("name")
+            platform = data.get("platform")
+            version = data.get("version")
+            port = int(data.get("port"))
+            host = str(source[0])
+            if (not isinstance(peer_id, str) or not peer_id
+                    or len(peer_id) > 256 or peer_id == config.get_device_id()
+                    or not host or host == "0.0.0.0"
+                    or not 1 <= port <= 65535):
+                return
+        except (AttributeError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+            return
+
+        with self._lock:
+            old = dict(self._peers.get(peer_id) or {})
+        needs_hello = (not old or old.get("host") != host
+                       or not old.get("host_confirmed"))
+        is_new = self.record_peer(
+            peer_id,
+            name=(name[:256] if isinstance(name, str) and name else peer_id),
+            host=host,
+            port=port,
+            platform=(platform[:64] if isinstance(platform, str)
+                      else "unknown"),
+            version=(version[:64] if isinstance(version, str)
+                     else "unknown"),
+            source="broadcast",
+            addresses=[host],
+            clip=(str(data.get("clip") or "") if "clip" in data else None),
+        )
+        if is_new:
+            log.info("broadcast: peer seen: %s (%s:%d)",
+                     name or peer_id, host, port)
+        if needs_hello:
+            # Confirm TCP reachability and make discovery reciprocal promptly.
+            self._hello_wake.set()
+
+    def _beacon_loop(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listening = False
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if sys.platform != "win32" and hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            try:
+                sock.bind(("", beacon_port()))
+                listening = True
+            except OSError as exc:
+                # Still advertise from an ephemeral port. Another process may
+                # own the listener, but peers can discover this daemon.
+                log.warning("broadcast discovery cannot listen on UDP %d "
+                            "(%s); sending only", beacon_port(), exc)
+                sock.bind(("", 0))
+            self._beacon_socket = sock
+            next_send = 0.0
+            while not self._stop.is_set():
+                now = time.monotonic()
+                if self._beacon_wake.is_set() or now >= next_send:
+                    self._beacon_wake.clear()
+                    self._send_beacon(sock)
+                    next_send = now + BEACON_INTERVAL
+                timeout = max(0.05, min(1.0, next_send - time.monotonic()))
+                if not listening:
+                    self._beacon_wake.wait(timeout)
+                    continue
+                sock.settimeout(timeout)
+                try:
+                    raw, source = sock.recvfrom(BEACON_MAX_BYTES)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                    raise
+                self._handle_beacon(raw, source)
+        except Exception as exc:
+            if not self._stop.is_set():
+                log.warning("broadcast discovery stopped: %s", exc)
+        finally:
+            if self._beacon_socket is sock:
+                self._beacon_socket = None
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     # -- zeroconf listener callbacks (duck-typed ServiceListener) -----------
 
@@ -689,6 +945,7 @@ class Discovery:
         """Ask the hello loop to run a round immediately (non-blocking; safe
         to call from request handlers)."""
         self._hello_wake.set()
+        self._beacon_wake.set()
 
     def _hello_loop(self) -> None:
         # A round on start, then every HELLO_INTERVAL or whenever woken.

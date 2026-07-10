@@ -141,7 +141,11 @@ def ensure_daemon():
     home = crosscopy_home()
     os.makedirs(home, exist_ok=True)
     with open(os.path.join(home, "daemon.log"), "ab") as log:
-        subprocess.Popen([sys.executable, "-m", "crosscopy.daemon"],
+        executable = sys.executable
+        if sys.platform == "win32":
+            from crosscopy.windows import make_windows_launcher
+            executable = make_windows_launcher()
+        subprocess.Popen([executable, "-m", "crosscopy.daemon"],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                          **background_popen_kwargs())
     deadline = time.time() + 5.0

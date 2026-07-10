@@ -29,6 +29,32 @@ log = logging.getLogger("crosscopy.daemon")
 _cleanup_state = {"done": False, "discovery": None, "updater": None}
 
 
+def _ensure_windows_executable_identity():
+    """Move legacy/update starts onto the branded launcher before binding.
+
+    A daemon updated from an older release may initially be re-executed by
+    the old Python-branded file. At this point no mutex or socket exists yet,
+    so switching to the new launcher is safe and keeps the firewall owner
+    consistently identified as Cross Copy.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        from .windows import (make_windows_launcher,
+                              refresh_registered_startup_commands)
+        executable = make_windows_launcher()
+        current = os.path.normcase(os.path.abspath(sys.executable))
+        replacement = os.path.normcase(os.path.abspath(executable))
+        if (current != replacement
+                and os.path.basename(executable).lower().startswith(
+                    "cross copy")):
+            refresh_registered_startup_commands(executable)
+            os.execv(executable,
+                     [executable, "-m", "crosscopy.daemon"])
+    except Exception as exc:
+        log.warning("could not activate Windows executable identity: %s", exc)
+
+
 def _cleanup():
     if _cleanup_state["done"]:
         return
@@ -61,6 +87,21 @@ def _restart_daemon():
     from the updater thread). The PID is preserved, so systemd/launchd keep
     supervising the same process."""
     log.info("restarting desktop processes to load the updated code")
+    executable = sys.executable
+    if sys.platform == "win32":
+        try:
+            from importlib.metadata import version as package_version
+            installed_version = package_version("cross-copy")
+        except Exception:
+            installed_version = __version__
+        try:
+            from .windows import (make_windows_launcher,
+                                  refresh_registered_startup_commands)
+            executable = make_windows_launcher(installed_version)
+            refresh_registered_startup_commands(executable)
+        except Exception as exc:
+            log.warning("could not refresh Windows executable identity: %s",
+                        exc)
     try:
         # Login startup entries are not supervisors on Windows. Restart the
         # already-running widget explicitly so it does not keep old modules
@@ -106,11 +147,12 @@ def _restart_daemon():
         # process is still unwinding. Give its socket and mutex time to close.
         os.environ["CROSSCOPY_RESTART_DELAY"] = "0.5"
         release_daemon_mutex()
-    os.execv(sys.executable, [sys.executable, "-m", "crosscopy.daemon"])
+    os.execv(executable, [executable, "-m", "crosscopy.daemon"])
 
 
 def main():
     if sys.platform == "win32":
+        _ensure_windows_executable_identity()
         from .windows import ensure_stdio
         ensure_stdio(str(config.daemon_log_path()))
     logging.basicConfig(

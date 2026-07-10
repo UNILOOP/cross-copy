@@ -36,8 +36,8 @@ Administrator access is not required.
    irm https://raw.githubusercontent.com/UNILOOP/cross-copy/main/install.ps1 | iex
    ```
 
-3. If Windows Defender Firewall asks for permission, allow Cross Copy on
-   Private networks.
+3. If Windows Defender Firewall asks for permission, allow **Cross Copy** on
+   Private networks. The prompt identifies the app as Cross Copy, not Python.
 
 The installer creates a dedicated environment in
 `%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and configures the
@@ -371,6 +371,11 @@ Each computer runs a small background daemon. The daemons advertise themselves
 over mDNS as `_crosscopy._tcp` and communicate directly over HTTP on the local
 network.
 
+Cross Copy also sends a small UDP broadcast beacon as a fallback when a router
+or Windows network adapter handles multicast unreliably. The beacon contains
+device metadata only; clipboard contents and files are still transferred
+directly over HTTP after a peer is found.
+
 When you run `ccp copy`, Cross Copy records a clipboard manifest. Files are not
 transferred until another computer runs `ccp paste`. The receiving computer
 then downloads the files directly from the source.
@@ -394,6 +399,11 @@ ccp add 192.168.1.5
 
 If one computer can discover the other, Cross Copy normally restores
 two-direction visibility within about a minute.
+
+On Windows, Cross Copy automatically rescans network adapters when Wi-Fi,
+Ethernet, VPN, or virtual-network addresses change. If discovery remains
+intermittent, confirm that Windows Defender Firewall allows Cross Copy on
+Private networks and that UDP port `7374` is not blocked.
 
 ### Computers appear, but transfers fail
 
@@ -470,7 +480,7 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.5.0 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.5.2 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
 send offers.
