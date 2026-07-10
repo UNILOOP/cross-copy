@@ -41,7 +41,8 @@ Administrator access is not required.
 
 The installer creates a dedicated environment in
 `%LOCALAPPDATA%\CrossCopy`, adds `ccp` to your user PATH, and configures the
-daemon and notification-area widget to start when you sign in.
+daemon and notification-area widget to start when you sign in. It also adds a
+Cross Copy submenu to Explorer's file and folder context menu.
 
 The installer updates both your persistent user PATH and the current
 PowerShell session, so `ccp` is available immediately.
@@ -89,6 +90,9 @@ can enable it later with `ccp daemon install`.
 The tray widget uses each desktop's native file chooser. On minimal Linux
 desktops, install `zenity` (GTK) or `kdialog` (KDE) for native file selection;
 Tk is used only when neither desktop chooser is available.
+
+The installer also adds Finder Quick Actions on macOS and right-click actions
+for Nautilus, GNOME Files, Nemo, Caja, and Dolphin on Linux.
 
 To repair only the shell PATH configuration without reinstalling the package,
 run `./install.sh --path-only` from a cloned repository.
@@ -172,6 +176,34 @@ ccp move archive.zip
 ```
 
 Source files are not removed if the transfer fails.
+
+## Share from the file manager
+
+After installation, select one or more files or folders and open the normal
+right-click menu. Cross Copy provides two actions:
+
+- **Share to all devices** puts the selection on the network clipboard. Any
+  connected computer can then paste it.
+- **Share to a device…** opens the platform's device chooser and sends an
+  offer to one computer. The receiving computer must accept the offer.
+
+Where the actions appear depends on the operating system:
+
+- On macOS, open **Quick Actions** or **Services** in Finder.
+- On Windows, open the **Cross Copy** submenu. Windows 11 may place classic
+  extension menus under **Show more options**.
+- On Linux, look under the file manager's **Scripts**, **Actions**, or
+  **Services** submenu. GNOME Files/Nautilus, Nemo, Caja, and Dolphin are
+  configured automatically. Install `zenity` or `kdialog` if your desktop
+  does not already provide one of them for the device chooser.
+
+The main installers add these actions automatically. To install, repair, or
+remove only the file-manager integration, run:
+
+```sh
+ccp context install
+ccp context uninstall
+```
 
 ## Send to a specific computer
 
@@ -309,6 +341,10 @@ pipx inject cross-copy pystray Pillow
 | `ccp widget` | Run the tray or menu-bar widget in the foreground |
 | `ccp widget install` | Start the widget now and at login |
 | `ccp widget uninstall` | Stop the widget and remove it from login startup |
+| `ccp context install` | Install native file-manager sharing actions |
+| `ccp context uninstall` | Remove native file-manager sharing actions |
+| `ccp context share-all <paths...>` | Invoke the share-to-all action directly |
+| `ccp context share-to <paths...>` | Open the native device chooser and send an offer |
 | `ccp daemon start` | Start the background daemon |
 | `ccp daemon stop` | Stop the background daemon |
 | `ccp daemon status` | Show daemon status |
@@ -507,7 +543,7 @@ The script asks whether it should also remove your Cross Copy data.
 
 ## Security
 
-Cross Copy version 0.5.5 uses a trusted-LAN model. It does not currently
+Cross Copy version 0.6.0 uses a trusted-LAN model. It does not currently
 authenticate devices or encrypt transfers. Any device that can reach the
 Cross Copy daemon on your network may be able to read the shared clipboard or
 send offers. Recovery details and controls, including destination paths and

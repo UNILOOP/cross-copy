@@ -40,6 +40,21 @@ remove_managed_path_block() {
     REMOVED_SOMETHING=1
 }
 
+remove_context_fallback() {
+    rm -rf \
+        "$HOME/Library/Services/Cross Copy - Share to All.workflow" \
+        "$HOME/Library/Services/Cross Copy - Share to Device.workflow"
+    rm -f \
+        "$HOME/.local/share/nautilus/scripts/Cross Copy/Share to all devices" \
+        "$HOME/.local/share/nautilus/scripts/Cross Copy/Share to a device…" \
+        "$HOME/.local/share/nemo/scripts/Cross Copy/Share to all devices" \
+        "$HOME/.local/share/nemo/scripts/Cross Copy/Share to a device…" \
+        "$HOME/.config/caja/scripts/Cross Copy/Share to all devices" \
+        "$HOME/.config/caja/scripts/Cross Copy/Share to a device…" \
+        "$HOME/.local/share/kio/servicemenus/cross-copy.desktop" \
+        "$HOME/.local/share/kservices5/ServiceMenus/cross-copy.desktop"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Tear down autostart + stop the daemon, while `ccp` still exists.
 #    `ccp daemon uninstall` owns the service teardown (systemd unit / launchd
@@ -65,10 +80,15 @@ elif command -v ccp >/dev/null 2>&1; then
 fi
 
 if [ -n "$CCP_BIN" ]; then
+    info "Removing file-manager context actions ..."
+    "$CCP_BIN" context uninstall >/dev/null 2>&1 || true
+    remove_context_fallback
     info "Removing daemon autostart (ccp daemon uninstall) ..."
     "$CCP_BIN" daemon uninstall >/dev/null 2>&1 || true
     "$CCP_BIN" daemon stop >/dev/null 2>&1 || true
 else
+    # Best-effort cleanup for an incomplete install whose CLI is already gone.
+    remove_context_fallback
     # Best-effort cleanup of service files left behind without `ccp`.
     if [ "$OS" = "Linux" ]; then
         UNIT_FILE="$HOME/.config/systemd/user/cross-copy.service"

@@ -164,6 +164,12 @@ try {
     & $CcpExe version
     if ($LASTEXITCODE -ne 0) { throw "The installed ccp command failed verification." }
 
+    Write-Info "Installing Explorer context-menu actions ..."
+    & $CcpExe context install
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Explorer actions could not be installed. Retry with: ccp context install"
+    }
+
     if (-not $NoService) {
         Write-Info "Enabling daemon autostart ..."
         & $CcpExe daemon install

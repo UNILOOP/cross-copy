@@ -36,6 +36,7 @@ $DataDir = if ($env:CROSSCOPY_HOME) { $env:CROSSCOPY_HOME } else { Join-Path $HO
 
 if (Test-Path $CcpExe) {
     Write-Info "Stopping Cross Copy and removing login autostart ..."
+    & $CcpExe context uninstall *> $null
     & $CcpExe widget uninstall *> $null
     & $CcpExe daemon uninstall *> $null
     & $CcpExe daemon stop *> $null
@@ -44,12 +45,16 @@ if (Test-Path $CcpExe) {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500
 } else {
+    Remove-Item "HKCU:\Software\Classes\AllFilesystemObjects\shell\CrossCopy" -Recurse -Force -ErrorAction SilentlyContinue
     $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
     Remove-ItemProperty $RunKey -Name "Cross Copy Daemon" -ErrorAction SilentlyContinue
     Remove-ItemProperty $RunKey -Name "Cross Copy Widget" -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $DataDir "Cross Copy Daemon.pyw") -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $DataDir "Cross Copy Widget.pyw") -Force -ErrorAction SilentlyContinue
 }
+
+# Exact fallback cleanup also handles a damaged or older CLI.
+Remove-Item "HKCU:\Software\Classes\AllFilesystemObjects\shell\CrossCopy" -Recurse -Force -ErrorAction SilentlyContinue
 
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $Kept = @($UserPath -split ";" | Where-Object {

@@ -10,6 +10,8 @@ UX metaphor: `ccp copy file.txt` on machine A, `ccp paste` on machine B — the 
   (mDNS) discovery. Serves the peer-facing transfer API, the local control API, and the web UI.
 - **CLI** (`crosscopy/cli.py`): thin HTTP client talking to the *local* daemon only.
   Auto-starts the daemon in the background if it isn't running.
+- **Context-menu integration** (`crosscopy/contextmenu.py`): installs per-user Finder,
+  Explorer, and Linux file-manager actions backed by the local CLI/API.
 - **Web UI** (`crosscopy/webui/` — `index.html`, `app.js`, `style.css`): static files served
   by the daemon at `/`. Talks to the local control API via fetch().
 
@@ -75,6 +77,29 @@ field (the full string, UTF-8, max 1 MB — reject larger with 400), no `files` 
   Interactive installs start a refreshed login shell in the same terminal;
   non-interactive installs skip the reload. `--path-only` repairs only this
   configuration. uninstall.sh removes only the managed blocks it created.
+- Both installers call `ccp context install` after package verification. Uninstallers call
+  `ccp context uninstall` before removing the environment, with exact-path or registry
+  fallback cleanup for incomplete installations.
+
+## Native file-manager actions
+
+- Two actions accept multi-file and directory selections:
+  - **Share to all devices** calls local `/api/copy` with `op=copy`, placing the selection on
+    the network clipboard for any peer to paste.
+  - **Share to a device…** fetches `/api/peers`, opens a native chooser, then calls `/api/send`
+    without waiting for the targeted offer to finish.
+- macOS installs Automator Quick Action workflows under `~/Library/Services/` for Finder.
+- Windows installs a per-user cascading Explorer verb under
+  `HKCU\Software\Classes\AllFilesystemObjects\shell\CrossCopy`. Commands use the branded
+  `Cross Copy.exe` GUI launcher, `%*` multi-selection, and require no administrator access.
+- Linux installs executable scripts for Nautilus/GNOME Files, Nemo, and Caja, plus KDE 5/6
+  Dolphin service menus. The device chooser uses Zenity or KDialog; a single known peer can
+  be selected without either helper.
+- File-manager launchers call the active environment's absolute Python path instead of
+  relying on a graphical session's PATH. macOS/Linux wrappers detach immediately; Explorer
+  uses the no-console branded launcher.
+- `ccp context install|uninstall` owns the lifecycle. `share-all` and
+  `share-to [--to peer]` are supported invocation actions used by native registrations.
 
 ## Reciprocal discovery — "hello" (v0.3)
 
@@ -367,6 +392,9 @@ transitions. Must stay dependency-free (pure CSS) and legible (WCAG-ish contrast
 - `ccp devices` (alias `ccp list`) — table: name, ip, platform, clipboard summary ("3 files, 2.1 MB" or "-").
 - `ccp status` — daemon status + current local clipboard.
 - `ccp clear` — clear local clipboard.
+- `ccp context install|uninstall` — add/remove native file-manager sharing actions.
+- `ccp context share-all <path...>` — put a file-manager selection on the network clipboard.
+- `ccp context share-to [--to peer] <path...>` — choose a peer and create a targeted offer.
 - `ccp add <host> [port]` — add manual peer (when mDNS is blocked).
 - `ccp name <newname>` — set device name.
 - `ccp daemon run|start|stop|status` — `run` foreground, `start` background (detached

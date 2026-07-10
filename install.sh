@@ -340,6 +340,17 @@ info "Verifying install ..."
 "$CCP" version || die "'ccp version' failed — the install did not complete correctly."
 
 # ---------------------------------------------------------------------------
+# 6b. Native Finder/file-manager quick actions
+# ---------------------------------------------------------------------------
+info "Installing file-manager context actions ..."
+if "$CCP" context install; then
+    info "Right-click sharing actions installed."
+else
+    warn "Could not install file-manager actions (not fatal)."
+    warn "Retry later with:  ccp context install"
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Daemon autostart (default; skip with --no-service)
 #    `ccp daemon install` owns the systemd-unit/launchd-plist details.
 # ---------------------------------------------------------------------------

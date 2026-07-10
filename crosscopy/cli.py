@@ -893,6 +893,96 @@ def cmd_transfers(args):
     print("Remove partial files with: ccp transfers --remove <id>")
 
 
+def _context_notify(title, message):
+    try:
+        from crosscopy.notify import notify
+        notify(title, message)
+    except Exception:
+        pass
+
+
+def _context_fail(message):
+    _context_notify("Cross Copy", message)
+    die(message)
+
+
+def cmd_context(args):
+    """Install native file-manager actions or handle an invoked action."""
+    from crosscopy import contextmenu
+
+    if args.context_action == "install":
+        try:
+            locations = contextmenu.install()
+        except Exception as exc:
+            die("Could not install context-menu actions: %s" % exc)
+        print("Installed Cross Copy file-manager actions.")
+        for location in locations:
+            print("   %s" % location)
+        return
+    if args.context_action == "uninstall":
+        try:
+            locations = contextmenu.uninstall()
+        except Exception as exc:
+            die("Could not remove context-menu actions: %s" % exc)
+        if locations:
+            print("Removed Cross Copy file-manager actions.")
+        else:
+            print("No Cross Copy file-manager actions were installed.")
+        return
+
+    paths = contextmenu.selected_paths(args.paths)
+    if not paths:
+        _context_fail("No existing files or folders were selected.")
+    ensure_daemon()
+
+    if args.context_action == "share-all":
+        response = api_post(
+            "/api/copy", {"paths": paths, "op": "copy"},
+            timeout=MANIFEST_BUILD_TIMEOUT)
+        if not response.ok:
+            _context_fail("Could not share selected items: %s"
+                          % api_error_message(response))
+        _context_notify(
+            "Cross Copy", "Shared %s to the network clipboard."
+            % plural(len(paths), "item"))
+        print("Shared %s to all devices." % plural(len(paths), "item"))
+        return
+
+    peers_response = api_get("/api/peers", timeout=10)
+    if not peers_response.ok:
+        _context_fail("Could not load Cross Copy devices: %s"
+                      % api_error_message(peers_response))
+    peers = peers_response.json().get("peers") or []
+    if not peers:
+        _context_fail("No Cross Copy devices are currently available.")
+    if args.to:
+        matches = [peer for peer in peers
+                   if peer.get("id") == args.to
+                   or (peer.get("name") or "").casefold()
+                   == args.to.casefold()]
+        if len(matches) != 1:
+            _context_fail("No unique device matches '%s'." % args.to)
+        peer = matches[0]
+    else:
+        try:
+            peer = contextmenu.choose_peer(peers)
+        except contextmenu.ChooserUnavailable as exc:
+            _context_fail(str(exc))
+        if peer is None:
+            return
+    response = api_post(
+        "/api/send", {"peer_id": peer.get("id"), "paths": paths},
+        timeout=MANIFEST_BUILD_TIMEOUT)
+    peer_name = peer.get("name") or peer.get("id") or "device"
+    if not response.ok:
+        _context_fail("Could not share to %s: %s"
+                      % (peer_name, api_error_message(response)))
+    _context_notify(
+        "Cross Copy", "Offered %s to %s. They can accept it now."
+        % (plural(len(paths), "item"), peer_name))
+    print("Offered %s to %s." % (plural(len(paths), "item"), peer_name))
+
+
 def cmd_accept(args):
     ensure_daemon()
     offers = fetch_offers()
@@ -2099,6 +2189,19 @@ def build_parser():
 
     p = sub.add_parser("clear", help="clear the local clipboard")
     p.set_defaults(func=cmd_clear)
+
+    p = sub.add_parser(
+        "context",
+        help="install or invoke native file-manager sharing actions")
+    p.add_argument(
+        "context_action",
+        choices=["install", "uninstall", "share-all", "share-to"],
+        help="install/uninstall integrations, share to the network clipboard, "
+             "or offer to one chosen device")
+    p.add_argument("paths", nargs="*", metavar="path")
+    p.add_argument("--to", metavar="NAME_OR_ID",
+                   help="target device for share-to (otherwise show picker)")
+    p.set_defaults(func=cmd_context)
 
     p = sub.add_parser("add", help="add a peer manually (when mDNS is blocked)")
     p.add_argument("host")
